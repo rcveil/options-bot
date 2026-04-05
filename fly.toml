@@ -9,16 +9,10 @@ primary_region = "sin"
 [processes]
   app = "python main.py"
 
+[machines]
+  auto_stop = false
+  
 [[vm]]
   memory = "512mb"
   cpu_kind = "shared"
   cpus = 1
-
-[[services]]
-  auto_stop_machines = false
-  auto_start_machines = true
-  min_machines_running = 1
-
-[[services.ports]]
-    handlers = ["http"]
-    port = 80
