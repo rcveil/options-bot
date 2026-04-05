@@ -26,12 +26,12 @@ def classify_vix(vix: float) -> str:
 
 async def get_ivr(symbol: str) -> float:
     """
-    IV Rank (0–100) from Tastytrade market metrics.
+    IV Rank from Tastytrade market metrics endpoint.
     Falls back to 50 if unavailable.
     """
     session = await get_session()
     try:
-        from tastytrade.market_data import get_market_metrics
+        from tastytrade.metrics import get_market_metrics
         metrics = await get_market_metrics(session, [symbol])
         if metrics and metrics[0].implied_volatility_index_rank:
             return float(metrics[0].implied_volatility_index_rank) * 100
