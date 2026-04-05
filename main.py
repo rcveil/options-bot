@@ -11,6 +11,7 @@ import schedule
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from telegram import Update
 
 from config.settings import ACCOUNT_SIZE, TIMEZONE
 from config.watchlist import ALL_SYMBOLS, INDEX_ONLY
