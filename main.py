@@ -283,24 +283,29 @@ async def main() -> None:
     # Initialise database
     await init_db()
 
-    # Start Telegram bot (handles /check /status /help)
-    tg_app = build_application()
-    await tg_app.initialize()
-    await tg_app.start()
-    await tg_app.updater.start_polling(drop_pending_updates=True)
-    logger.info("Telegram bot listening for commands")
-
     # Schedule scan at 09:30 ET every weekday
-    for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
-        getattr(schedule.every(), day).at("09:30").do(_run_scan_sync)
+for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
+    getattr(schedule.every(), day).at("09:30").do(_run_scan_sync)
 
-    logger.info("Scheduler armed — waiting for 09:30 ET on weekdays")
+logger.info("Scheduler armed — waiting for 09:30 ET on weekdays")
 
-    # Keep alive loop
+# Build Telegram app
+tg_app = build_application()
+
+# Run schedule loop in background while Telegram polls
+async def run_schedule():
     while True:
         schedule.run_pending()
         await asyncio.sleep(30)
 
+async with tg_app:
+    await tg_app.start()
+    await tg_app.updater.start_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+    )
+    logger.info("Telegram bot listening for commands")
+    await run_schedule()
 
 if __name__ == "__main__":
     asyncio.run(main())
