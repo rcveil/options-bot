@@ -1,29 +1,15 @@
-# fly.toml app configuration file generated for options-bot on 2026-04-05T13:56:21+08:00
-#
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
-
-app = 'options-bot'
-primary_region = 'sin'
+app = "options-bot"
+primary_region = "sin"
 
 [build]
 
 [env]
-  TZ = 'Asia/Singapore'
+  TZ = "Asia/Singapore"
 
 [processes]
-  app = 'python main.py'
-
-[http_service]
-  internal_port = 8080
-  force_https = true
-  auto_stop_machines = 'stop'
-  auto_start_machines = true
-  min_machines_running = 0
-  processes = ['app']
+  app = "python main.py"
 
 [[vm]]
-  memory = '512mb'
-  cpu_kind = 'shared'
+  memory = "512mb"
+  cpu_kind = "shared"
   cpus = 1
-  memory_mb = 512
