@@ -1,0 +1,15 @@
+app = "options-bot"
+primary_region = "sin"
+
+[build]
+
+[env]
+  TZ = "Asia/Singapore"
+
+[processes]
+  app = "python main.py"
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
