@@ -52,7 +52,12 @@ async def send_text(message: str) -> None:
 
 
 def build_application() -> Application:
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = (
+    Application.builder()
+    .token(TELEGRAM_BOT_TOKEN)
+    .updater(None)
+    .build()
+)
     app.add_handler(CommandHandler("check",  handle_check))
     app.add_handler(CommandHandler("status", handle_status))
     app.add_handler(CommandHandler("help",   handle_help))
