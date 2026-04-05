@@ -1,7 +1,8 @@
 """
 alerts/telegram.py
-Telegram bot sender and command handler.
-Commands: /check SYMBOL  /status  /help
+Telegram bot sender and command handlers.
+Compatible with python-telegram-bot v21.
+Commands: /check SYMBOL  /status  /help  /test
 """
 
 import logging
@@ -13,50 +14,48 @@ from config.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 logger = logging.getLogger(__name__)
 
-_bot: Bot | None = None
-
-
-async def get_bot() -> Bot:
-    global _bot
-    if _bot is None:
-        _bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    return _bot
-
 
 async def send_signal(message: str) -> None:
-    bot = await get_bot()
-    try:
-        await bot.send_message(
-            chat_id    = TELEGRAM_CHAT_ID,
-            text       = message,
-            parse_mode = ParseMode.HTML,
-        )
-        logger.info("Signal sent to Telegram")
-    except Exception as e:
-        logger.error(f"Telegram send_signal error: {e}")
+    """Send a formatted HTML signal alert."""
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    async with bot:
+        try:
+            await bot.send_message(
+                chat_id    = TELEGRAM_CHAT_ID,
+                text       = message,
+                parse_mode = ParseMode.HTML,
+            )
+            logger.info("Signal sent to Telegram")
+        except Exception as e:
+            logger.error(f"Telegram send_signal error: {e}")
 
 
 async def send_warning(message: str) -> None:
+    """Send a VIX regime warning."""
     await send_signal(message)
 
 
 async def send_text(message: str) -> None:
-    bot = await get_bot()
-    try:
-        await bot.send_message(
-            chat_id = TELEGRAM_CHAT_ID,
-            text    = message,
-        )
-    except Exception as e:
-        logger.error(f"Telegram send_text error: {e}")
+    """Send plain text (no HTML)."""
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    async with bot:
+        try:
+            await bot.send_message(
+                chat_id = TELEGRAM_CHAT_ID,
+                text    = message,
+            )
+        except Exception as e:
+            logger.error(f"Telegram send_text error: {e}")
 
 
 def build_application() -> Application:
-    app = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .build()
-    )
+    """
+    Build the Telegram Application with all command handlers.
+    Uses ApplicationBuilder — updater is created automatically.
+    Do NOT call initialize() or start() here — that is done in main.py
+    inside the async context manager.
+    """
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("check",  handle_check))
     app.add_handler(CommandHandler("status", handle_status))
     app.add_handler(CommandHandler("help",   handle_help))
@@ -80,23 +79,26 @@ async def handle_check(
         f"Re-evaluating latest signal for {symbol}..."
     )
 
-    from alerts.late_entry import evaluate_late_entry
-    result = await evaluate_late_entry(symbol)
-    await update.message.reply_text(result, parse_mode=ParseMode.HTML)
+    try:
+        from alerts.late_entry import evaluate_late_entry
+        result = await evaluate_late_entry(symbol)
+        await update.message.reply_text(result, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await update.message.reply_text(f"Error checking {symbol}: {e}")
 
 
 async def handle_status(
     update:  Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """/status — show bot health and current VIX regime."""
+    """/status — show bot health and VIX regime."""
     try:
         from data.market import get_vix, classify_vix
         vix    = await get_vix()
         regime = classify_vix(vix)
         vix_line = f"VIX: {vix:.1f} — {regime.upper()}"
-    except Exception as e:
-        vix_line = f"VIX: unavailable (market may be closed)"
+    except Exception:
+        vix_line = "VIX: unavailable (market may be closed)"
 
     await update.message.reply_text(
         f"✅ Bot running\n"
@@ -116,10 +118,12 @@ async def handle_help(
 ) -> None:
     """/help — list available commands."""
     await update.message.reply_text(
-        "/check SYMBOL — re-evaluate latest signal\n"
-        "/status       — bot health and VIX level\n"
-        "/help         — this message"
+        "/check SYMBOL  —  re-evaluate latest signal\n"
+        "/status        —  bot health and VIX level\n"
+        "/test          —  test Tastytrade connection\n"
+        "/help          —  this message"
     )
+
 
 async def handle_test(
     update:  Update,
@@ -136,7 +140,7 @@ async def handle_test(
         await get_session()
         results.append("✅ Session — logged in successfully")
     except Exception as e:
-        results.append(f"❌ Session — {str(e)[:60]}")
+        results.append(f"❌ Session — {str(e)[:80]}")
 
     # Test 2: Live quote
     try:
@@ -144,7 +148,7 @@ async def handle_test(
         quote = await get_quote("SPY")
         results.append(f"✅ Quote — SPY mid ${quote['mid']:.2f}")
     except Exception as e:
-        results.append(f"❌ Quote — {str(e)[:60]}")
+        results.append(f"❌ Quote — {str(e)[:80]}")
 
     # Test 3: VIX
     try:
@@ -153,7 +157,7 @@ async def handle_test(
         regime = classify_vix(vix)
         results.append(f"✅ VIX — {vix:.1f} ({regime})")
     except Exception as e:
-        results.append(f"❌ VIX — {str(e)[:60]}")
+        results.append(f"❌ VIX — {str(e)[:80]}")
 
     # Test 4: IVR
     try:
@@ -161,7 +165,7 @@ async def handle_test(
         ivr = await get_ivr("AAPL")
         results.append(f"✅ IVR — AAPL {ivr:.1f}")
     except Exception as e:
-        results.append(f"❌ IVR — {str(e)[:60]}")
+        results.append(f"❌ IVR — {str(e)[:80]}")
 
     # Test 5: Option chain
     try:
@@ -171,16 +175,19 @@ async def handle_test(
         if expiry:
             results.append(f"✅ Chain — AAPL expiry {expiry}")
         else:
-            results.append(f"⚠️ Chain — no expiry in DTE range (normal if market closed)")
+            results.append(
+                "⚠️ Chain — no expiry in DTE range "
+                "(normal if market closed)"
+            )
     except Exception as e:
-        results.append(f"❌ Chain — {str(e)[:60]}")
+        results.append(f"❌ Chain — {str(e)[:80]}")
 
     summary = (
         "Connection test results\n"
         "─────────────────────\n"
         + "\n".join(results)
         + "\n─────────────────────\n"
-        "Tests 2–5 may fail outside market hours.\n"
-        "Test 1 is the critical one."
+        "Tests 2–5 may show errors outside market hours.\n"
+        "Test 1 (Session) is the critical one."
     )
     await update.message.reply_text(summary)
