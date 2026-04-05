@@ -287,7 +287,7 @@ async def main() -> None:
     tg_app = build_application()
     await tg_app.initialize()
     await tg_app.start()
-    await tg_app.updater.start_polling()
+    await tg_app.updater.start_polling(drop_pending_updates=True)
     logger.info("Telegram bot listening for commands")
 
     # Schedule scan at 09:30 ET every weekday
