@@ -1,7 +1,7 @@
 """
 data/candles.py
-Fetches 1-minute OHLCV bars from Tastytrade for a given symbol.
-Used by signals/indicators.py for VWAP, EMA, ORB, RVOL.
+Fetches 1-minute OHLCV bars using DXLinkStreamer + Candle events.
+Correct API: subscribe_candle() with Candle from tastytrade.dxfeed
 """
 
 import logging
@@ -9,7 +9,8 @@ from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from tastytrade.market_data import get_candles, CandleType
+from tastytrade import DXLinkStreamer
+from tastytrade.dxfeed import Candle
 
 from data.tastytrade import get_session
 
@@ -18,22 +19,25 @@ logger = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
 
 
+def _candle_symbol(symbol: str, interval: str = "1m") -> str:
+    """
+    Build the dxfeed candle symbol string.
+    Format: SYMBOL{=1m}  e.g. SPY{=1m}, NVDA{=5m}
+    """
+    return f"{symbol}{{={interval}}}"
+
+
 async def fetch_intraday_bars(
-    symbol:       str,
-    from_time:    datetime | None = None,
-    bar_size:     str = "1m",
+    symbol:    str,
+    from_time: datetime | None = None,
+    interval:  str = "1m",
 ) -> pd.DataFrame:
     """
-    Fetch 1-minute OHLCV bars for today's session from open to now.
+    Fetch 1-minute OHLCV bars for today from 09:30 ET to now.
 
     Returns a DataFrame with columns:
-        datetime, open, high, low, close, volume
-    Indexed by datetime (ET, timezone-aware).
-
-    Args:
-        symbol:    Ticker e.g. "NVDA"
-        from_time: Start of fetch window (defaults to 09:30 ET today)
-        bar_size:  Candle size — "1m" default
+        open, high, low, close, volume
+    Indexed by datetime (ET, timezone-aware), sorted ascending.
     """
     session = await get_session()
 
@@ -44,40 +48,66 @@ async def fetch_intraday_bars(
             9, 30, 0, tzinfo=ET
         )
 
-    to_time = datetime.now(ET)
+    # Convert to milliseconds timestamp (dxfeed uses ms)
+    from_ts = int(from_time.timestamp() * 1000)
 
-    logger.debug(f"Fetching {bar_size} bars for {symbol} "
-                 f"from {from_time.strftime('%H:%M')} to "
-                 f"{to_time.strftime('%H:%M')} ET")
-
-    try:
-        candles = await get_candles(
-            session,
-            symbol,
-            interval    = bar_size,
-            start_time  = from_time,
-            end_time    = to_time,
-        )
-    except Exception as e:
-        logger.error(f"Failed to fetch candles for {symbol}: {e}")
-        return pd.DataFrame()
-
-    if not candles:
-        logger.warning(f"No candles returned for {symbol}")
-        return pd.DataFrame()
+    candle_sym = _candle_symbol(symbol, interval)
+    logger.debug(f"Subscribing to candle: {candle_sym} from {from_time.strftime('%H:%M')} ET")
 
     rows = []
-    for c in candles:
-        rows.append({
-            "datetime": c.time.astimezone(ET),
-            "open":     float(c.open),
-            "high":     float(c.high),
-            "low":      float(c.low),
-            "close":    float(c.close),
-            "volume":   float(c.volume),
-        })
+    try:
+        async with DXLinkStreamer(session) as streamer:
+            await streamer.subscribe_candle(
+                [candle_sym],
+                from_time = from_ts,
+            )
+            # Collect candles until snapshot is complete
+            # Candles arrive with SNAPSHOT_END flag when done
+            async for candle in streamer.listen(Candle):
+                if candle.event_symbol != candle_sym:
+                    continue
 
-    df = pd.DataFrame(rows).set_index("datetime").sort_index()
+                # Convert ms timestamp to ET datetime
+                bar_time = datetime.fromtimestamp(
+                    candle.time / 1000, tz=ET
+                )
+
+                # Only keep bars from our window
+                if bar_time < from_time:
+                    continue
+
+                rows.append({
+                    "datetime": bar_time,
+                    "open":     float(candle.open),
+                    "high":     float(candle.high),
+                    "low":      float(candle.low),
+                    "close":    float(candle.close),
+                    "volume":   float(candle.volume or 0),
+                })
+
+                # Stop after snapshot is fully delivered
+                # snapshot_end flag signals the last candle in batch
+                if hasattr(candle, 'snapshot_end') and candle.snapshot_end:
+                    break
+
+                # Safety: stop if we have enough bars for the session
+                # (09:30 to now = max ~60 bars in first-hour window)
+                if len(rows) >= 80:
+                    break
+
+    except Exception as e:
+        logger.error(f"Candle fetch failed for {symbol}: {e}")
+        return pd.DataFrame()
+
+    if not rows:
+        logger.warning(f"{symbol}: no candle data returned")
+        return pd.DataFrame()
+
+    df = (
+        pd.DataFrame(rows)
+        .set_index("datetime")
+        .sort_index()
+    )
     logger.debug(f"{symbol}: {len(df)} bars fetched")
     return df
 
@@ -88,31 +118,41 @@ async def fetch_avg_volume(
 ) -> float:
     """
     Fetch average daily volume over the past N trading days.
-    Used to compute RVOL (relative volume).
-
-    Returns average volume as a float (0.0 if unavailable).
+    Uses daily candles (1d) to compute the rolling average.
+    Returns 0.0 if unavailable.
     """
     session = await get_session()
 
-    today     = date.today()
-    from_date = today - timedelta(days=lookback * 2)   # buffer for weekends
+    today      = date.today()
+    from_date  = today - timedelta(days=lookback * 2)   # buffer for weekends
+    from_dt    = datetime(from_date.year, from_date.month, from_date.day, tzinfo=ET)
+    from_ts    = int(from_dt.timestamp() * 1000)
+
+    candle_sym = _candle_symbol(symbol, "1d")
+    volumes    = []
 
     try:
-        candles = await get_candles(
-            session,
-            symbol,
-            interval   = "1d",
-            start_time = datetime(from_date.year, from_date.month,
-                                  from_date.day, tzinfo=ET),
-            end_time   = datetime(today.year, today.month,
-                                  today.day, 23, 59, tzinfo=ET),
-        )
+        async with DXLinkStreamer(session) as streamer:
+            await streamer.subscribe_candle(
+                [candle_sym],
+                from_time = from_ts,
+            )
+            async for candle in streamer.listen(Candle):
+                if candle.event_symbol != candle_sym:
+                    continue
+                if candle.volume:
+                    volumes.append(float(candle.volume))
+                if hasattr(candle, 'snapshot_end') and candle.snapshot_end:
+                    break
+                if len(volumes) >= lookback * 2:
+                    break
     except Exception as e:
         logger.error(f"Avg volume fetch failed for {symbol}: {e}")
         return 0.0
 
-    if not candles:
+    if not volumes:
         return 0.0
 
-    volumes = [float(c.volume) for c in candles[-lookback:] if c.volume]
-    return sum(volumes) / len(volumes) if volumes else 0.0
+    avg = sum(volumes[-lookback:]) / len(volumes[-lookback:])
+    logger.debug(f"{symbol}: avg daily volume = {avg:,.0f}")
+    return avg
