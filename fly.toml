@@ -5,18 +5,15 @@ primary_region = "sin"
 
 [env]
   TZ = "Asia/Singapore"
+  PYTHONUNBUFFERED = "1"
+  PYTHONDONTWRITEBYTECODE = "1"
 
 [processes]
   app = "python main.py"
 
-[machines]
-  auto_stop = false
-
-[[vm]]
-  memory = "512mb"
-  cpu_kind = "shared"
-  cpus = 1
-
 [deploy]
   strategy = "immediate"
-  max_unavailable = 1
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
