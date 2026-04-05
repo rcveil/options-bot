@@ -85,17 +85,23 @@ async def handle_status(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """/status — show bot health and current VIX regime."""
-    from data.market import get_vix, classify_vix
-    vix    = await get_vix()
-    regime = classify_vix(vix)
+    try:
+        from data.market import get_vix, classify_vix
+        vix    = await get_vix()
+        regime = classify_vix(vix)
+        vix_line = f"VIX: {vix:.1f} — {regime.upper()}"
+    except Exception as e:
+        vix_line = f"VIX: unavailable (market may be closed)"
+
     await update.message.reply_text(
         f"✅ Bot running\n"
-        f"VIX: {vix:.1f} — {regime.upper()}\n\n"
+        f"{vix_line}\n\n"
         f"Watchlist:\n"
         f"Semicon: MU AVGO STX AMD NVDA\n"
         f"Metals:  GLD SLV\n"
         f"Tech:    MSFT GOOGL AMZN AAPL\n"
-        f"Index:   SPX SPY QQQ"
+        f"Index:   SPX SPY QQQ\n\n"
+        f"Next scan: weekdays at 09:30 ET (21:30 SGT)"
     )
 
 
