@@ -55,10 +55,9 @@ async def get_session() -> Session:
         )
 
     try:
-        _session = await Session.create(
-            client_id,
-            client_secret,
-            refresh_token = refresh_token,
+        _session = Session(
+        client_secret,
+        refresh_token,
         )
         logger.info("Tastytrade OAuth session created successfully")
     except Exception as e:
