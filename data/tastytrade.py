@@ -88,8 +88,8 @@ async def get_greeks(
     async with DXLinkStreamer(session) as streamer:
         await streamer.subscribe(Greeks, [occ])
         await streamer.subscribe(Quote,  [occ])
-        g = await asyncio.wait_for(streamer.get_event(Greeks), timeout=5.0)
-	q = await asyncio.wait_for(streamer.get_event(Quote),  timeout=5.0)
+        g = await streamer.get_event(Greeks)
+        q = await streamer.get_event(Quote)
 
     bid = float(q.bid_price) if q.bid_price else 0.0
     ask = float(q.ask_price) if q.ask_price else 0.0
@@ -120,7 +120,7 @@ async def get_quote(symbol: str) -> dict:
 
     async with DXLinkStreamer(session) as streamer:
         await streamer.subscribe(Quote, [symbol])
-        q = await asyncio.wait_for(streamer.get_event(Quote), timeout=5.0)
+        q = await streamer.get_event(Quote)
 
     bid = float(q.bid_price) if q.bid_price else 0.0
     ask = float(q.ask_price) if q.ask_price else 0.0
