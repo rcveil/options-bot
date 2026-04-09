@@ -1,10 +1,11 @@
 """
 data/tastytrade.py
 Tastytrade session, live greeks, quotes, and option chain strikes.
-Uses OAuth2 (client_id + client_secret + refresh_token) — NOT username/password.
+
+Authentication uses OAuth2 — only client_secret and refresh_token needed.
+No username/password. No Session.create().
 
 Required environment variables:
-    TASTYTRADE_CLIENT_ID
     TASTYTRADE_CLIENT_SECRET
     TASTYTRADE_REFRESH_TOKEN
 """
@@ -24,24 +25,21 @@ _session: Session | None = None
 
 async def get_session() -> Session:
     """
-    Return a cached Tastytrade OAuth session.
+    Return a cached Tastytrade session.
     Creates a new session on first call, reuses it afterwards.
-    Raises clearly if environment variables are missing.
+
+    Correct constructor for tastytrade==12.3.2:
+        Session(client_secret, refresh_token)
+    NOT Session.create() — that method does not exist.
     """
     global _session
 
     if _session is not None:
         return _session
 
-    client_id     = os.getenv("TASTYTRADE_CLIENT_ID")
     client_secret = os.getenv("TASTYTRADE_CLIENT_SECRET")
     refresh_token = os.getenv("TASTYTRADE_REFRESH_TOKEN")
 
-    if not client_id:
-        raise ValueError(
-            "TASTYTRADE_CLIENT_ID is not set. "
-            "Add it to your .env file or Railway/Fly.io secrets."
-        )
     if not client_secret:
         raise ValueError(
             "TASTYTRADE_CLIENT_SECRET is not set. "
@@ -51,17 +49,17 @@ async def get_session() -> Session:
         raise ValueError(
             "TASTYTRADE_REFRESH_TOKEN is not set. "
             "Add it to your .env file or Railway/Fly.io secrets. "
-            "See the API setup guide to generate one."
+            "Get one from: developer.tastytrade.com "
+            "→ your app → Manage → Create Grant."
         )
 
     try:
-        _session = Session(
-        client_secret,
-        refresh_token,
-        )
-        logger.info("Tastytrade OAuth session created successfully")
+        # Direct constructor — synchronous, no await needed
+        _session = Session(client_secret, refresh_token)
+        logger.info("Tastytrade session created successfully")
     except Exception as e:
         logger.error(f"Tastytrade session creation failed: {e}")
+        _session = None
         raise
 
     return _session
@@ -160,7 +158,7 @@ async def get_option_chain_strikes(
     if target not in chain:
         logger.warning(
             f"{symbol}: expiry {expiry} not found in chain. "
-            f"Available: {sorted(chain.keys())[:5]}"
+            f"Available dates: {sorted(chain.keys())[:5]}"
         )
         return []
 
