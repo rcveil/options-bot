@@ -1,29 +1,55 @@
 """
 data/market.py
 VIX fetch, IVR fetch, VIX regime classifier.
+
+VIX strategy (in order):
+1. Try Yahoo Finance public API (no auth, reliable during market hours)
+2. Try Tastytrade DXLink streamer with multiple symbol formats
+3. Fall back to 20.0 (elevated-normal boundary) with a warning
 """
 
 import asyncio
 import logging
 
-from tastytrade import DXLinkStreamer
-from tastytrade.dxfeed import Quote
+import aiohttp
 
 from data.tastytrade import get_session
 from config.thresholds import VIX_NORMAL, VIX_ELEVATED, VIX_SPIKE, VIX_PAUSE
 
 logger = logging.getLogger(__name__)
 
-# Tastytrade uses $VIX.X for spot VIX — fallbacks included
-VIX_SYMBOLS = ["$VIX.X", "VIX", "CBOE:VIX"]
+VIX_SYMBOLS    = ["$VIX.X", "VIX", "CBOE:VIX"]
+VIX_YAHOO_URL  = "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX?interval=1m&range=1d"
+VIX_DEFAULT    = 20.0   # safe fallback — sits at elevated/normal boundary
 
 
-async def get_vix() -> float:
-    """
-    Fetch live VIX mid price.
-    Tries multiple symbol formats until one returns data.
-    Raises if all fail.
-    """
+async def _fetch_vix_yahoo() -> float | None:
+    """Fetch VIX from Yahoo Finance public API. Returns None on failure."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                VIX_YAHOO_URL,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                price = (
+                    data["chart"]["result"][0]
+                    ["meta"]["regularMarketPrice"]
+                )
+                return round(float(price), 2)
+    except Exception as e:
+        logger.warning(f"Yahoo VIX fetch failed: {e}")
+        return None
+
+
+async def _fetch_vix_tastytrade() -> float | None:
+    """Fetch VIX from Tastytrade DXLink streamer. Returns None on failure."""
+    from tastytrade import DXLinkStreamer
+    from tastytrade.dxfeed import Quote
+
     session = await get_session()
 
     for symbol in VIX_SYMBOLS:
@@ -38,16 +64,41 @@ async def get_vix() -> float:
             ask = float(q.ask_price) if q.ask_price else 0.0
             mid = round((bid + ask) / 2, 2)
             if mid > 0:
-                logger.info(f"VIX fetched via {symbol}: {mid}")
+                logger.info(f"VIX fetched via Tastytrade {symbol}: {mid}")
                 return mid
         except asyncio.TimeoutError:
-            logger.warning(f"VIX timeout with {symbol}, trying next")
+            logger.warning(f"Tastytrade VIX timeout with {symbol}")
             continue
         except Exception as e:
-            logger.warning(f"VIX failed with {symbol}: {e}")
+            logger.warning(f"Tastytrade VIX failed with {symbol}: {e}")
             continue
 
-    raise Exception("VIX unavailable — all symbol formats failed")
+    return None
+
+
+async def get_vix() -> float:
+    """
+    Fetch live VIX. Tries Yahoo Finance first, then Tastytrade,
+    then returns a safe default of 20.0 with a warning.
+    """
+    # 1. Try Yahoo Finance
+    vix = await _fetch_vix_yahoo()
+    if vix and vix > 0:
+        logger.info(f"VIX from Yahoo Finance: {vix}")
+        return vix
+
+    # 2. Try Tastytrade streamer
+    vix = await _fetch_vix_tastytrade()
+    if vix and vix > 0:
+        return vix
+
+    # 3. Safe default
+    logger.warning(
+        f"VIX unavailable from all sources. "
+        f"Using default {VIX_DEFAULT} (elevated/normal boundary). "
+        f"Signals will fire with reduced size as precaution."
+    )
+    return VIX_DEFAULT
 
 
 def classify_vix(vix: float) -> str:
