@@ -25,7 +25,7 @@ async def get_vix() -> float:
     session = await get_session()
 
     # Tastytrade uses $VIX.X for the spot VIX index
-    for vix_symbol in ["$VIX.X", "VIX", "CBOE:VIX"]:
+    for vix_symbol in ["$VIX.X", "VIX", "CBOE:VIX", "VX"]:
         try:
             async with DXLinkStreamer(session) as streamer:
                 await streamer.subscribe(Quote, [vix_symbol])
