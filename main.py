@@ -2,11 +2,6 @@
 main.py
 Scheduler and main scan loop.
 Fires every weekday at 09:30 ET.
-
-Key design:
-- Telegram Application runs inside async with block (v21 pattern)
-- schedule library runs inside the same async loop via asyncio.sleep
-- No threading — everything is async
 """
 
 import asyncio
@@ -44,10 +39,6 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 
 ET = ZoneInfo(TIMEZONE)
-
-# Global reference to the running Telegram app
-# Used by scan to send signals without rebuilding the bot
-_tg_app = None
 
 
 async def scan_ticker(symbol: str, vix: float, regime: str) -> None:
@@ -90,6 +81,7 @@ async def scan_ticker(symbol: str, vix: float, regime: str) -> None:
         dte_min, dte_max = decision.dte_target
 
         # 6. Find best spread via option chain
+        # chain.py returns net_credit (short mid - long mid) and credit_ratio
         spread = await build_spread(
             symbol           = symbol,
             structure        = decision.structure,
@@ -107,22 +99,24 @@ async def scan_ticker(symbol: str, vix: float, regime: str) -> None:
         spread_width = spread["spread_width"]
         expiry       = spread["expiry"]
         dte          = spread["dte"]
-        greeks       = spread["greeks"]
+        greeks       = spread["greeks"]       # short leg greeks
         option_type  = "P" if "put" in decision.strategy else "C"
 
-        credit_debit = greeks["mid"]
-        max_loss     = spread_width - credit_debit
+        # Use net_credit from chain (short mid - long mid), not just short mid
+        net_credit   = spread["net_credit"]
+        credit_ratio = spread["credit_ratio"]
+        max_loss     = spread["max_loss"]     # spread_width - net_credit
         ba_spread    = greeks["ask"] - greeks["bid"]
 
-        # 7. PoP
-        pop = compute_pop(price, sell_strike, dte, greeks["iv"], option_type)
+        # 7. PoP — based on short strike
+        pop = compute_pop(
+            price, sell_strike, dte, greeks["iv"], option_type
+        )
 
         # 8. Filter gates
-        ratio = credit_debit / spread_width if spread_width > 0 else 0
-
         if decision.structure == "credit":
             result = check_credit_spread(
-                credit         = credit_debit,
+                credit         = net_credit,
                 width          = spread_width,
                 pop            = pop,
                 bid_ask_spread = ba_spread,
@@ -135,7 +129,7 @@ async def scan_ticker(symbol: str, vix: float, regime: str) -> None:
             )
         else:
             result = check_debit_spread(
-                debit          = credit_debit,
+                debit          = net_credit,
                 width          = spread_width,
                 pop            = pop,
                 bid_ask_spread = ba_spread,
@@ -153,16 +147,16 @@ async def scan_ticker(symbol: str, vix: float, regime: str) -> None:
             )
             return
 
-        # 9. Position sizing
+        # 9. Position sizing — based on max loss per contract
         sizing = compute_position_size(
             account_size = ACCOUNT_SIZE,
-            max_loss     = max_loss * 100,
+            max_loss     = max_loss * 100,   # per contract (100 multiplier)
             vix_regime   = regime,
         )
 
-        # 10. Exit levels
-        exits = credit_exits(credit_debit) if decision.structure == "credit" \
-                else debit_exits(credit_debit)
+        # 10. Exit levels — based on net credit received
+        exits = credit_exits(net_credit) if decision.structure == "credit" \
+                else debit_exits(net_credit)
 
         # 11. Enrich rationale with indicator data
         rationale = (
@@ -189,10 +183,10 @@ async def scan_ticker(symbol: str, vix: float, regime: str) -> None:
             buy_strike         = buy_strike,
             expiry             = expiry,
             dte                = dte,
-            credit_debit       = credit_debit,
+            credit_debit       = net_credit,
             max_loss           = max_loss,
             ivr                = ivr,
-            credit_width_ratio = ratio,
+            credit_width_ratio = credit_ratio,
             bid_ask_spread     = ba_spread,
             mid_price          = greeks["mid"],
             delta              = greeks["delta"],
@@ -225,10 +219,11 @@ async def scan_ticker(symbol: str, vix: float, regime: str) -> None:
             "structure":    decision.structure,
             "sell_strike":  sell_strike,
             "buy_strike":   buy_strike,
+            "spread_width": spread_width,
             "option_type":  option_type,
             "expiry":       expiry,
             "dte":          dte,
-            "credit_debit": credit_debit,
+            "credit_debit": net_credit,
             "max_loss":     max_loss,
             "ivr":          ivr,
             "vix":          vix,
@@ -246,7 +241,13 @@ async def scan_ticker(symbol: str, vix: float, regime: str) -> None:
             "timestamp_et": now_et,
         })
 
-        logger.info(f"{symbol}: signal sent and logged ✓")
+        logger.info(
+            f"{symbol}: signal sent — "
+            f"{sell_strike}/{buy_strike} "
+            f"width=${spread_width:.1f} "
+            f"credit=${net_credit:.2f} "
+            f"ratio={credit_ratio:.0%} ✓"
+        )
 
     except Exception as e:
         logger.error(f"{symbol}: scan error — {e}", exc_info=True)
@@ -261,18 +262,15 @@ async def run_scan() -> None:
     regime = classify_vix(vix)
     logger.info(f"VIX {vix:.1f} — regime: {regime}")
 
-    # VIX pause: warn and abort
     if regime == "pause":
         await send_warning(format_vix_warning(vix, regime))
         logger.info("VIX pause — standing down")
         return
 
-    # Send elevated/spike warning
     warning = format_vix_warning(vix, regime)
     if warning:
         await send_warning(warning)
 
-    # Restrict to index symbols during spike
     symbols = INDEX_ONLY if regime == "spike" else ALL_SYMBOLS
     logger.info(f"Scanning {len(symbols)} symbols")
 
@@ -283,21 +281,15 @@ async def run_scan() -> None:
 
 
 async def schedule_loop() -> None:
-    """
-    Runs the schedule library inside the async event loop.
-    Checks for pending jobs every 30 seconds.
-    """
     while True:
         schedule.run_pending()
         await asyncio.sleep(30)
 
 
 async def main() -> None:
-    # Initialise database
     await init_db()
     logger.info("Database initialised")
 
-    # Schedule scan at 09:30 ET every weekday
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
         getattr(schedule.every(), day).at("09:30").do(
             lambda: asyncio.create_task(run_scan())
@@ -305,11 +297,8 @@ async def main() -> None:
 
     logger.info("Scheduler armed — waiting for 09:30 ET on weekdays")
 
-    # Build Telegram application
     tg_app = build_application()
 
-    # Run everything inside the async context manager (v21 correct pattern)
-    # This properly initialises the updater and handles shutdown cleanly
     async with tg_app:
         await tg_app.start()
         await tg_app.updater.start_polling(
@@ -317,8 +306,6 @@ async def main() -> None:
             allowed_updates      = Update.ALL_TYPES,
         )
         logger.info("Telegram bot listening for commands")
-
-        # Run schedule loop — this keeps main() alive indefinitely
         await schedule_loop()
 
 
