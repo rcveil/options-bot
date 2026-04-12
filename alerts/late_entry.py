@@ -1,6 +1,7 @@
 """
 alerts/late_entry.py
 Re-evaluates a stored signal against live market data.
+Correctly computes net credit from both legs of the spread.
 Called by /check SYMBOL Telegram command.
 """
 
@@ -10,7 +11,6 @@ from data.market import get_vix, classify_vix, get_ivr
 from signals.strategy import compute_pop
 from alerts.formatter import format_late_entry
 from storage.journal import get_latest_signal
-from config.settings import ACCOUNT_SIZE
 from config.thresholds import MIN_CREDIT_WIDTH_RATIO, MIN_POP_CREDIT, MIN_POP_ELEVATED
 
 logger = logging.getLogger(__name__)
@@ -26,26 +26,52 @@ async def evaluate_late_entry(symbol: str) -> str:
         regime = classify_vix(vix)
         ivr    = await get_ivr(symbol)
         quote  = await get_quote(symbol)
-        greeks = await get_greeks(
-            symbol,
-            signal["expiry"],
-            signal["sell_strike"],
-            signal["option_type"],
-        )
     except Exception as e:
-        logger.error(f"Late entry data fetch failed for {symbol}: {e}")
         return f"Could not fetch live data for {symbol}: {e}"
 
-    current_mid  = greeks["mid"]
-    spread_width = abs(signal["sell_strike"] - signal["buy_strike"])
-    current_ratio = current_mid / spread_width if spread_width > 0 else 0
+    sell_strike = signal["sell_strike"]
+    buy_strike  = signal["buy_strike"]
+    option_type = signal["option_type"]
+    expiry      = signal["expiry"]
+    dte         = signal["dte"]
+
+    # Spread width — use stored value if available, else compute from strikes
+    spread_width = signal.get("spread_width") or abs(sell_strike - buy_strike)
+
+    # Fetch current greeks for BOTH legs to get accurate net credit
+    try:
+        short_greeks = await get_greeks(
+            symbol, expiry, sell_strike, option_type
+        )
+        long_greeks = await get_greeks(
+            symbol, expiry, buy_strike, option_type
+        )
+        current_net_credit = round(
+            short_greeks["mid"] - long_greeks["mid"], 2
+        )
+    except Exception as e:
+        logger.warning(
+            f"Could not fetch both legs for {symbol}, "
+            f"falling back to short leg only: {e}"
+        )
+        try:
+            short_greeks = await get_greeks(
+                symbol, expiry, sell_strike, option_type
+            )
+            current_net_credit = short_greeks["mid"]
+        except Exception as e2:
+            return f"Could not fetch greeks for {symbol}: {e2}"
+
+    current_ratio = (
+        current_net_credit / spread_width if spread_width > 0 else 0
+    )
 
     pop = compute_pop(
         underlying_price = quote["mid"],
-        strike           = signal["sell_strike"],
-        dte              = signal["dte"],
-        iv               = greeks["iv"],
-        option_type      = signal["option_type"],
+        strike           = sell_strike,
+        dte              = dte,
+        iv               = short_greeks["iv"],
+        option_type      = option_type,
     )
 
     stored_vwap = signal.get("vwap", quote["mid"])
@@ -61,22 +87,29 @@ async def evaluate_late_entry(symbol: str) -> str:
     if current_ratio >= MIN_CREDIT_WIDTH_RATIO and pop >= min_pop:
         verdict = "valid"
         advice  = (
-            f"Setup still intact. Enter at ${current_mid:.2f} mid. "
-            f"Set stop at ${current_mid * 2:.2f}."
+            f"Setup still intact. "
+            f"Net credit now ${current_net_credit:.2f} "
+            f"on ${spread_width:.1f}-wide spread ({current_ratio:.0%}). "
+            f"Enter at market. Stop at ${current_net_credit * 2:.2f}."
         )
-    elif current_ratio >= MIN_CREDIT_WIDTH_RATIO * 0.85 and pop >= min_pop * 0.95:
+    elif (
+        current_ratio >= MIN_CREDIT_WIDTH_RATIO * 0.85
+        and pop >= min_pop * 0.95
+    ):
         verdict = "marginal"
         advice  = (
-            f"Credit slipped to ${current_mid:.2f} "
-            f"(ratio {current_ratio:.0%}, just below threshold). "
+            f"Credit slipped to ${current_net_credit:.2f} "
+            f"(ratio {current_ratio:.0%}, just below 30% threshold). "
             f"If entering, use 1 contract only. "
-            f"Stop at ${current_mid * 2:.2f}."
+            f"Stop at ${current_net_credit * 2:.2f}."
         )
     else:
         verdict = "expired"
         advice  = (
-            f"Setup has deteriorated — credit/width {current_ratio:.0%}, "
-            f"PoP {pop:.0%}. Do not enter."
+            f"Setup has deteriorated — "
+            f"net credit ${current_net_credit:.2f}, "
+            f"ratio {current_ratio:.0%}, PoP {pop:.0%}. "
+            f"Do not enter."
         )
 
     return format_late_entry(
@@ -84,7 +117,7 @@ async def evaluate_late_entry(symbol: str) -> str:
         strategy         = signal["strategy"],
         original_time    = signal["timestamp_et"],
         original_credit  = signal["credit_debit"],
-        current_credit   = current_mid,
+        current_credit   = current_net_credit,
         current_ratio    = current_ratio,
         current_pop      = pop,
         current_ivr      = ivr,
