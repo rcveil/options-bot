@@ -1,7 +1,7 @@
 """
 storage/journal.py
 SQLite async trade log.
-spread_width stored alongside sell/buy strikes for accurate late entry checks.
+Stores both vertical spread and iron condor signals.
 """
 
 import aiosqlite
@@ -13,34 +13,46 @@ DB_PATH = Path(__file__).parent / "db.sqlite3"
 
 CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS signals (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    symbol         TEXT    NOT NULL,
-    strategy       TEXT    NOT NULL,
-    direction      TEXT    NOT NULL,
-    structure      TEXT    NOT NULL,
-    sell_strike    REAL,
-    buy_strike     REAL,
-    spread_width   REAL,
-    option_type    TEXT,
-    expiry         TEXT,
-    dte            INTEGER,
-    credit_debit   REAL,
-    max_loss       REAL,
-    ivr            REAL,
-    vix            REAL,
-    vix_regime     TEXT,
-    pop            REAL,
-    delta          REAL,
-    theta          REAL,
-    vega           REAL,
-    iv             REAL,
-    contracts      INTEGER,
-    risk_dollars   REAL,
-    vwap           REAL,
-    rvol           REAL,
-    rationale      TEXT,
-    timestamp_et   TEXT,
-    created_at     TEXT DEFAULT (datetime('now'))
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol          TEXT    NOT NULL,
+    strategy        TEXT    NOT NULL,
+    direction       TEXT    NOT NULL,
+    structure       TEXT    NOT NULL,
+    -- Vertical spread fields
+    sell_strike     REAL,
+    buy_strike      REAL,
+    spread_width    REAL,
+    option_type     TEXT,
+    -- Iron condor fields
+    put_sell_strike  REAL,
+    put_buy_strike   REAL,
+    put_credit       REAL,
+    put_credit_ratio REAL,
+    call_sell_strike REAL,
+    call_buy_strike  REAL,
+    call_credit      REAL,
+    call_credit_ratio REAL,
+    wing_width       REAL,
+    -- Shared
+    expiry          TEXT,
+    dte             INTEGER,
+    credit_debit    REAL,
+    max_loss        REAL,
+    ivr             REAL,
+    vix             REAL,
+    vix_regime      TEXT,
+    pop             REAL,
+    delta           REAL,
+    theta           REAL,
+    vega            REAL,
+    iv              REAL,
+    contracts       INTEGER,
+    risk_dollars    REAL,
+    vwap            REAL,
+    rvol            REAL,
+    rationale       TEXT,
+    timestamp_et    TEXT,
+    created_at      TEXT DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS outcomes (
@@ -53,31 +65,47 @@ CREATE TABLE IF NOT EXISTS outcomes (
 );
 """
 
-# Migration: add spread_width column if upgrading from old schema
-MIGRATE_SQL = """
-ALTER TABLE signals ADD COLUMN spread_width REAL;
-"""
+# Migration queries for upgrading existing databases
+MIGRATIONS = [
+    "ALTER TABLE signals ADD COLUMN spread_width REAL;",
+    "ALTER TABLE signals ADD COLUMN put_sell_strike REAL;",
+    "ALTER TABLE signals ADD COLUMN put_buy_strike REAL;",
+    "ALTER TABLE signals ADD COLUMN put_credit REAL;",
+    "ALTER TABLE signals ADD COLUMN put_credit_ratio REAL;",
+    "ALTER TABLE signals ADD COLUMN call_sell_strike REAL;",
+    "ALTER TABLE signals ADD COLUMN call_buy_strike REAL;",
+    "ALTER TABLE signals ADD COLUMN call_credit REAL;",
+    "ALTER TABLE signals ADD COLUMN call_credit_ratio REAL;",
+    "ALTER TABLE signals ADD COLUMN wing_width REAL;",
+]
 
 
 async def init_db() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(CREATE_SQL)
-        # Add spread_width column if it doesn't exist (migration for existing DBs)
-        try:
-            await db.execute(MIGRATE_SQL)
-            await db.commit()
-            logger.info("Migrated: added spread_width column to signals table")
-        except Exception:
-            pass  # Column already exists — expected on fresh or already-migrated DBs
+        for sql in MIGRATIONS:
+            try:
+                await db.execute(sql)
+                await db.commit()
+            except Exception:
+                pass  # Column already exists
     logger.info(f"Database ready at {DB_PATH}")
 
 
 async def log_signal(payload: dict) -> int:
+    """
+    Insert a signal. Works for both vertical spreads and iron condors.
+    IC payloads include put_*/call_* keys; vertical spreads do not.
+    Missing keys default to None via .get().
+    """
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("""
             INSERT INTO signals (
                 symbol, strategy, direction, structure,
                 sell_strike, buy_strike, spread_width, option_type,
+                put_sell_strike, put_buy_strike, put_credit, put_credit_ratio,
+                call_sell_strike, call_buy_strike, call_credit, call_credit_ratio,
+                wing_width,
                 expiry, dte, credit_debit, max_loss,
                 ivr, vix, vix_regime,
                 pop, delta, theta, vega, iv,
@@ -86,13 +114,52 @@ async def log_signal(payload: dict) -> int:
             ) VALUES (
                 :symbol, :strategy, :direction, :structure,
                 :sell_strike, :buy_strike, :spread_width, :option_type,
+                :put_sell_strike, :put_buy_strike, :put_credit, :put_credit_ratio,
+                :call_sell_strike, :call_buy_strike, :call_credit, :call_credit_ratio,
+                :wing_width,
                 :expiry, :dte, :credit_debit, :max_loss,
                 :ivr, :vix, :vix_regime,
                 :pop, :delta, :theta, :vega, :iv,
                 :contracts, :risk_dollars, :vwap, :rvol,
                 :rationale, :timestamp_et
             )
-        """, payload)
+        """, {
+            "symbol":           payload["symbol"],
+            "strategy":         payload["strategy"],
+            "direction":        payload["direction"],
+            "structure":        payload["structure"],
+            "sell_strike":      payload.get("sell_strike"),
+            "buy_strike":       payload.get("buy_strike"),
+            "spread_width":     payload.get("spread_width"),
+            "option_type":      payload.get("option_type"),
+            "put_sell_strike":  payload.get("put_sell_strike"),
+            "put_buy_strike":   payload.get("put_buy_strike"),
+            "put_credit":       payload.get("put_credit"),
+            "put_credit_ratio": payload.get("put_credit_ratio"),
+            "call_sell_strike": payload.get("call_sell_strike"),
+            "call_buy_strike":  payload.get("call_buy_strike"),
+            "call_credit":      payload.get("call_credit"),
+            "call_credit_ratio":payload.get("call_credit_ratio"),
+            "wing_width":       payload.get("wing_width"),
+            "expiry":           payload["expiry"],
+            "dte":              payload["dte"],
+            "credit_debit":     payload["credit_debit"],
+            "max_loss":         payload["max_loss"],
+            "ivr":              payload["ivr"],
+            "vix":              payload["vix"],
+            "vix_regime":       payload["vix_regime"],
+            "pop":              payload["pop"],
+            "delta":            payload["delta"],
+            "theta":            payload["theta"],
+            "vega":             payload["vega"],
+            "iv":               payload["iv"],
+            "contracts":        payload["contracts"],
+            "risk_dollars":     payload["risk_dollars"],
+            "vwap":             payload["vwap"],
+            "rvol":             payload["rvol"],
+            "rationale":        payload["rationale"],
+            "timestamp_et":     payload["timestamp_et"],
+        })
         await db.commit()
         return cursor.lastrowid
 
@@ -120,7 +187,6 @@ async def log_outcome(
         await db.execute("""
             INSERT INTO outcomes
                 (signal_id, closed_at, close_price, pnl, exit_reason)
-            VALUES
-                (?, datetime('now'), ?, ?, ?)
+            VALUES (?, datetime('now'), ?, ?, ?)
         """, (signal_id, close_price, pnl, exit_reason))
         await db.commit()
