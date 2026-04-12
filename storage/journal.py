@@ -1,7 +1,7 @@
 """
 storage/journal.py
-SQLite trade log with async access via aiosqlite.
-Stores every fired signal and outcome for review.
+SQLite async trade log.
+spread_width stored alongside sell/buy strikes for accurate late entry checks.
 """
 
 import aiosqlite
@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS signals (
     structure      TEXT    NOT NULL,
     sell_strike    REAL,
     buy_strike     REAL,
+    spread_width   REAL,
     option_type    TEXT,
     expiry         TEXT,
     dte            INTEGER,
@@ -52,11 +53,22 @@ CREATE TABLE IF NOT EXISTS outcomes (
 );
 """
 
+# Migration: add spread_width column if upgrading from old schema
+MIGRATE_SQL = """
+ALTER TABLE signals ADD COLUMN spread_width REAL;
+"""
+
 
 async def init_db() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(CREATE_SQL)
-        await db.commit()
+        # Add spread_width column if it doesn't exist (migration for existing DBs)
+        try:
+            await db.execute(MIGRATE_SQL)
+            await db.commit()
+            logger.info("Migrated: added spread_width column to signals table")
+        except Exception:
+            pass  # Column already exists — expected on fresh or already-migrated DBs
     logger.info(f"Database ready at {DB_PATH}")
 
 
@@ -65,15 +77,17 @@ async def log_signal(payload: dict) -> int:
         cursor = await db.execute("""
             INSERT INTO signals (
                 symbol, strategy, direction, structure,
-                sell_strike, buy_strike, option_type, expiry, dte,
-                credit_debit, max_loss, ivr, vix, vix_regime,
+                sell_strike, buy_strike, spread_width, option_type,
+                expiry, dte, credit_debit, max_loss,
+                ivr, vix, vix_regime,
                 pop, delta, theta, vega, iv,
                 contracts, risk_dollars, vwap, rvol,
                 rationale, timestamp_et
             ) VALUES (
                 :symbol, :strategy, :direction, :structure,
-                :sell_strike, :buy_strike, :option_type, :expiry, :dte,
-                :credit_debit, :max_loss, :ivr, :vix, :vix_regime,
+                :sell_strike, :buy_strike, :spread_width, :option_type,
+                :expiry, :dte, :credit_debit, :max_loss,
+                :ivr, :vix, :vix_regime,
                 :pop, :delta, :theta, :vega, :iv,
                 :contracts, :risk_dollars, :vwap, :rvol,
                 :rationale, :timestamp_et
