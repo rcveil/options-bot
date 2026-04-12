@@ -1,10 +1,11 @@
 """
 alerts/formatter.py
 Builds Telegram message strings from signal payloads.
-Uses HTML parse mode for bold/formatting in Telegram.
+Supports vertical spreads and iron condors.
 """
 
 from dataclasses import dataclass, field
+from typing import Optional
 
 
 @dataclass
@@ -18,7 +19,7 @@ class SignalPayload:
     vix_regime:    str
     timestamp_et:  str
 
-    # Trade structure
+    # Vertical spread fields (used for all non-IC strategies)
     sell_strike:   float
     buy_strike:    float
     expiry:        str
@@ -26,36 +27,47 @@ class SignalPayload:
     credit_debit:  float
     max_loss:      float
 
-    # Threshold values
-    ivr:                float
-    credit_width_ratio: float
-    bid_ask_spread:     float
-    mid_price:          float
+    # Iron condor fields (None for vertical spreads)
+    put_sell_strike:   Optional[float] = None
+    put_buy_strike:    Optional[float] = None
+    put_credit:        Optional[float] = None
+    put_credit_ratio:  Optional[float] = None
+    call_sell_strike:  Optional[float] = None
+    call_buy_strike:   Optional[float] = None
+    call_credit:       Optional[float] = None
+    call_credit_ratio: Optional[float] = None
+    wing_width:        Optional[float] = None
 
-    # Greeks
-    delta:         float
-    gamma:         float
-    theta:         float
-    vega:          float
-    iv:            float
-    open_interest: int
+    # Threshold values
+    ivr:                float = 50.0
+    credit_width_ratio: float = 0.0
+    bid_ask_spread:     float = 0.0
+    mid_price:          float = 0.0
+
+    # Greeks (short leg / put leg for IC)
+    delta:         float = 0.0
+    gamma:         float = 0.0
+    theta:         float = 0.0
+    vega:          float = 0.0
+    iv:            float = 0.0
+    open_interest: int   = 0
 
     # PoP and sizing
-    pop:           float
-    contracts:     int
-    risk_dollars:  float
-    risk_pct:      float
+    pop:           float = 0.0
+    contracts:     int   = 1
+    risk_dollars:  float = 0.0
+    risk_pct:      float = 0.0
 
     # Exits
-    stop_level:    float
-    profit_target: float
-    stop_note:     str
-    target_note:   str
+    stop_level:    float = 0.0
+    profit_target: float = 0.0
+    stop_note:     str   = ""
+    target_note:   str   = ""
 
     # Rationale
-    rationale:     str
-    rvol:          float
-    warnings:      list[str] = field(default_factory=list)
+    rationale:     str         = ""
+    rvol:          float       = 1.0
+    warnings:      list[str]   = field(default_factory=list)
 
 
 STRATEGY_LABELS = {
@@ -85,6 +97,40 @@ def _pop_bar(pop: float, width: int = 10) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+def _format_vertical(p: SignalPayload, structure_tag: str,
+                     credit_sign: str) -> str:
+    """Format message for single vertical spread."""
+    return (
+        f"<b>Trade structure</b>\n"
+        f"Sell  {p.sell_strike:.0f}  |  Buy  {p.buy_strike:.0f}\n"
+        f"Expiry  {p.expiry}  ·  {p.dte} DTE\n"
+        f"{p.structure.capitalize()}  {credit_sign}${abs(p.credit_debit):.2f}"
+        f"  ·  Max loss  ${p.max_loss:.2f}\n\n"
+        f"<b>Entry gates</b>\n"
+        f"IVR {p.ivr:.0f}  ·  Credit/width {p.credit_width_ratio:.0%}"
+        f"  ·  Bid/ask ${p.bid_ask_spread:.2f}"
+    )
+
+
+def _format_iron_condor(p: SignalPayload) -> str:
+    """Format message for iron condor (4 strikes)."""
+    return (
+        f"<b>Trade structure</b>\n"
+        f"Put wing:   Sell {p.put_sell_strike:.0f}  |  Buy {p.put_buy_strike:.0f}"
+        f"  ·  Credit ${p.put_credit:.2f} ({p.put_credit_ratio:.0%})\n"
+        f"Call wing:  Sell {p.call_sell_strike:.0f}  |  Buy {p.call_buy_strike:.0f}"
+        f"  ·  Credit ${p.call_credit:.2f} ({p.call_credit_ratio:.0%})\n"
+        f"Expiry  {p.expiry}  ·  {p.dte} DTE\n"
+        f"Total credit  +${p.credit_debit:.2f}"
+        f"  ·  Wing width  ${p.wing_width:.1f}"
+        f"  ·  Max loss  ${p.max_loss:.2f}\n\n"
+        f"<b>Entry gates (per wing)</b>\n"
+        f"IVR {p.ivr:.0f}"
+        f"  ·  Put ratio {p.put_credit_ratio:.0%}"
+        f"  ·  Call ratio {p.call_credit_ratio:.0%}"
+    )
+
+
 def format_signal(p: SignalPayload) -> str:
     regime_tag    = f"{REGIME_ICON.get(p.vix_regime, '')} VIX {p.vix:.1f} — {p.vix_regime.upper()}"
     direction_tag = f"{DIRECTION_ICON.get(p.direction, '')} {p.direction.upper()}"
@@ -92,6 +138,10 @@ def format_signal(p: SignalPayload) -> str:
                     else "Buy to open (debit)"
     credit_sign   = "+" if p.credit_debit >= 0 else ""
     pop_bar       = _pop_bar(p.pop)
+
+    is_ic = p.strategy == "iron_condor"
+    trade_block = _format_iron_condor(p) if is_ic \
+                  else _format_vertical(p, structure_tag, credit_sign)
 
     warning_block = ""
     if p.warnings:
@@ -103,15 +153,9 @@ def format_signal(p: SignalPayload) -> str:
 <b>{p.symbol}  {direction_tag}</b>
 {STRATEGY_LABELS.get(p.strategy, p.strategy)}  ·  {structure_tag}
 
-<b>Trade structure</b>
-Sell  {p.sell_strike:.0f}  |  Buy  {p.buy_strike:.0f}
-Expiry  {p.expiry}  ·  {p.dte} DTE
-{p.structure.capitalize()}  {credit_sign}${abs(p.credit_debit):.2f}  ·  Max loss  ${p.max_loss:.2f}
+{trade_block}
 
-<b>Entry gates</b>
-IVR {p.ivr:.0f}  ·  Credit/width {p.credit_width_ratio:.0%}  ·  Bid/ask ${p.bid_ask_spread:.2f}
-
-<b>Greeks</b>
+<b>Greeks (short leg)</b>
 Δ {p.delta:+.3f}  Γ {p.gamma:.4f}  Θ {p.theta:+.3f}  V {p.vega:.3f}
 IV {p.iv:.1%}  ·  OI {p.open_interest:,}
 
@@ -166,12 +210,23 @@ def format_late_entry(
     price_vs_vwap:    str,
     verdict:          str,
     advice:           str,
+    # IC-specific (optional)
+    put_ratio:        Optional[float] = None,
+    call_ratio:       Optional[float] = None,
 ) -> str:
     verdict_map = {
         "valid":    "✅ Still valid — enter at current market",
         "marginal": "⚠️ Marginal — 1 contract only",
         "expired":  "❌ Setup expired — do not enter",
     }
+
+    wing_ratios = ""
+    if put_ratio is not None and call_ratio is not None:
+        wing_ratios = (
+            f"Put wing ratio: {put_ratio:.0%}  ·  "
+            f"Call wing ratio: {call_ratio:.0%}\n"
+        )
+
     return f"""🕐 <b>Late entry check — {symbol}</b>
 Original alert: {original_time}
 Strategy: {STRATEGY_LABELS.get(strategy, strategy)}
@@ -179,7 +234,7 @@ Strategy: {STRATEGY_LABELS.get(strategy, strategy)}
 <b>Original vs now</b>
 Credit then:  ${original_credit:.2f}
 Credit now:   ${current_credit:.2f}
-Credit/width: {current_ratio:.0%}  ·  PoP: {current_pop:.0%}
+{wing_ratios}Credit/width: {current_ratio:.0%}  ·  PoP: {current_pop:.0%}
 IVR: {current_ivr:.0f}  ·  Price vs VWAP: {price_vs_vwap}
 
 <b>Verdict</b>
