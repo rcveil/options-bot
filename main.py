@@ -2,6 +2,7 @@
 main.py
 Scheduler and main scan loop.
 Handles vertical spreads and iron condors.
+Detailed INFO logging at every stage so you can see why signals fire or not.
 """
 
 import asyncio
@@ -43,67 +44,61 @@ ET     = ZoneInfo(TIMEZONE)
 
 
 async def _scan_iron_condor(
-    symbol: str,
-    vix:    float,
-    regime: str,
-    ivr:    float,
-    price:  float,
-    vwap:   float,
-    rvol:   float,
-    ind:    dict,
-    now_et: str,
+    symbol: str, vix: float, regime: str, ivr: float,
+    price: float, vwap: float, rvol: float, ind: dict, now_et: str,
 ) -> None:
-    """Handle iron condor strategy for one symbol."""
-
     ic = await build_iron_condor(
-        symbol           = symbol,
-        underlying_price = price,
-        dte_min          = DTE_CREDIT_MIN,
-        dte_max          = DTE_CREDIT_MAX,
+        symbol=symbol, underlying_price=price,
+        dte_min=DTE_CREDIT_MIN, dte_max=DTE_CREDIT_MAX,
     )
     if ic is None:
-        logger.info(f"{symbol} IC: no valid condor found")
+        logger.info(f"{symbol} IC: chain returned None — no valid condor")
         return
 
     put_g  = ic["put_greeks"]
     call_g = ic["call_greeks"]
 
-    # Combined PoP = P(put OTM) × P(call OTM)
     put_pop  = compute_pop(price, ic["put_sell_strike"],
                            ic["dte"], put_g["iv"],  "P")
     call_pop = compute_pop(price, ic["call_sell_strike"],
                            ic["dte"], call_g["iv"], "C")
     combined_pop = round(put_pop * call_pop, 4)
 
-    result = check_iron_condor(
-        put_credit    = ic["put_credit"],
-        put_width     = ic["put_spread_width"],
-        put_delta     = put_g["delta"],
-        put_bid_ask   = put_g["ask"] - put_g["bid"],
-        put_mid       = put_g["mid"],
-        put_oi        = put_g.get("oi", 999),
-        call_credit   = ic["call_credit"],
-        call_width    = ic["call_spread_width"],
-        call_delta    = call_g["delta"],
-        call_bid_ask  = call_g["ask"] - call_g["bid"],
-        call_mid      = call_g["mid"],
-        call_oi       = call_g.get("oi", 999),
-        pop           = combined_pop,
-        dte           = ic["dte"],
-        symbol        = symbol,
-        vix_regime    = regime,
+    logger.info(
+        f"{symbol} IC: put_pop={put_pop:.0%} call_pop={call_pop:.0%} "
+        f"combined={combined_pop:.0%}"
     )
 
-    if not result.passed:
-        logger.info(f"{symbol} IC: filtered — {'; '.join(result.reasons)}")
-        return
-
-    sizing = compute_position_size(
-        account_size = ACCOUNT_SIZE,
-        max_loss     = ic["max_loss"] * 100,
+    result = check_iron_condor(
+        put_credit   = ic["put_credit"],
+        put_width    = ic["put_spread_width"],
+        put_delta    = put_g["delta"],
+        put_bid_ask  = put_g["ask"] - put_g["bid"],
+        put_mid      = put_g["mid"],
+        put_oi       = put_g.get("oi", 999),
+        call_credit  = ic["call_credit"],
+        call_width   = ic["call_spread_width"],
+        call_delta   = call_g["delta"],
+        call_bid_ask = call_g["ask"] - call_g["bid"],
+        call_mid     = call_g["mid"],
+        call_oi      = call_g.get("oi", 999),
+        pop          = combined_pop,
+        dte          = ic["dte"],
+        symbol       = symbol,
         vix_regime   = regime,
     )
 
+    if not result.passed:
+        logger.info(
+            f"{symbol} IC: REJECTED — {'; '.join(result.reasons)}"
+        )
+        return
+
+    sizing = compute_position_size(
+        account_size=ACCOUNT_SIZE,
+        max_loss=ic["max_loss"] * 100,
+        vix_regime=regime,
+    )
     exits = credit_exits(ic["total_credit"])
 
     rationale = (
@@ -120,14 +115,12 @@ async def _scan_iron_condor(
         vix                = vix,
         vix_regime         = regime,
         timestamp_et       = now_et,
-        # Vertical fields — use put wing as primary display
         sell_strike        = ic["put_sell_strike"],
         buy_strike         = ic["put_buy_strike"],
         expiry             = ic["expiry"],
         dte                = ic["dte"],
         credit_debit       = ic["total_credit"],
         max_loss           = ic["max_loss"],
-        # IC-specific fields
         put_sell_strike    = ic["put_sell_strike"],
         put_buy_strike     = ic["put_buy_strike"],
         put_credit         = ic["put_credit"],
@@ -137,19 +130,16 @@ async def _scan_iron_condor(
         call_credit        = ic["call_credit"],
         call_credit_ratio  = ic["call_credit_ratio"],
         wing_width         = ic["wing_width"],
-        # Thresholds
         ivr                = ivr,
         credit_width_ratio = min(ic["put_credit_ratio"], ic["call_credit_ratio"]),
         bid_ask_spread     = put_g["ask"] - put_g["bid"],
         mid_price          = put_g["mid"],
-        # Greeks (put short leg)
         delta              = put_g["delta"],
         gamma              = put_g.get("gamma", 0.0),
         theta              = put_g.get("theta", 0.0),
         vega               = put_g.get("vega",  0.0),
         iv                 = put_g["iv"],
         open_interest      = put_g.get("oi", 0),
-        # Sizing
         pop                = combined_pop,
         contracts          = sizing["contracts"],
         risk_dollars       = sizing["risk_dollars"],
@@ -164,74 +154,59 @@ async def _scan_iron_condor(
     )
 
     await send_signal(format_signal(payload))
-
     await log_signal({
-        "symbol":           symbol,
-        "strategy":         "iron_condor",
-        "direction":        "neutral",
-        "structure":        "credit",
-        "sell_strike":      None,
-        "buy_strike":       None,
-        "spread_width":     None,
-        "option_type":      None,
-        "put_sell_strike":  ic["put_sell_strike"],
-        "put_buy_strike":   ic["put_buy_strike"],
-        "put_credit":       ic["put_credit"],
-        "put_credit_ratio": ic["put_credit_ratio"],
-        "call_sell_strike": ic["call_sell_strike"],
-        "call_buy_strike":  ic["call_buy_strike"],
-        "call_credit":      ic["call_credit"],
-        "call_credit_ratio":ic["call_credit_ratio"],
-        "wing_width":       ic["wing_width"],
-        "expiry":           ic["expiry"],
-        "dte":              ic["dte"],
-        "credit_debit":     ic["total_credit"],
-        "max_loss":         ic["max_loss"],
-        "ivr":              ivr,
-        "vix":              vix,
-        "vix_regime":       regime,
-        "pop":              combined_pop,
-        "delta":            put_g["delta"],
-        "theta":            put_g.get("theta", 0.0),
-        "vega":             put_g.get("vega",  0.0),
-        "iv":               put_g["iv"],
-        "contracts":        sizing["contracts"],
-        "risk_dollars":     sizing["risk_dollars"],
-        "vwap":             vwap,
-        "rvol":             rvol,
-        "rationale":        rationale,
-        "timestamp_et":     now_et,
+        "symbol":            symbol,
+        "strategy":          "iron_condor",
+        "direction":         "neutral",
+        "structure":         "credit",
+        "sell_strike":       None,
+        "buy_strike":        None,
+        "spread_width":      None,
+        "option_type":       None,
+        "put_sell_strike":   ic["put_sell_strike"],
+        "put_buy_strike":    ic["put_buy_strike"],
+        "put_credit":        ic["put_credit"],
+        "put_credit_ratio":  ic["put_credit_ratio"],
+        "call_sell_strike":  ic["call_sell_strike"],
+        "call_buy_strike":   ic["call_buy_strike"],
+        "call_credit":       ic["call_credit"],
+        "call_credit_ratio": ic["call_credit_ratio"],
+        "wing_width":        ic["wing_width"],
+        "expiry":            ic["expiry"],
+        "dte":               ic["dte"],
+        "credit_debit":      ic["total_credit"],
+        "max_loss":          ic["max_loss"],
+        "ivr":               ivr,
+        "vix":               vix,
+        "vix_regime":        regime,
+        "pop":               combined_pop,
+        "delta":             put_g["delta"],
+        "theta":             put_g.get("theta", 0.0),
+        "vega":              put_g.get("vega",  0.0),
+        "iv":                put_g["iv"],
+        "contracts":         sizing["contracts"],
+        "risk_dollars":      sizing["risk_dollars"],
+        "vwap":              vwap,
+        "rvol":              rvol,
+        "rationale":         rationale,
+        "timestamp_et":      now_et,
     })
-
     logger.info(f"{symbol} IC: signal sent ✓")
 
 
 async def _scan_vertical(
-    symbol:   str,
-    decision,
-    vix:      float,
-    regime:   str,
-    ivr:      float,
-    price:    float,
-    vwap:     float,
-    rvol:     float,
-    ind:      dict,
-    now_et:   str,
+    symbol: str, decision, vix: float, regime: str, ivr: float,
+    price: float, vwap: float, rvol: float, ind: dict, now_et: str,
 ) -> None:
-    """Handle vertical spread strategy for one symbol."""
-
     dte_min, dte_max = decision.dte_target
 
     spread = await build_spread(
-        symbol           = symbol,
-        structure        = decision.structure,
-        direction        = decision.direction,
-        underlying_price = price,
-        dte_min          = dte_min,
-        dte_max          = dte_max,
+        symbol=symbol, structure=decision.structure,
+        direction=decision.direction, underlying_price=price,
+        dte_min=dte_min, dte_max=dte_max,
     )
     if spread is None:
-        logger.info(f"{symbol}: no valid spread found")
+        logger.info(f"{symbol}: chain returned None — no valid spread")
         return
 
     sell_strike  = spread["sell_strike"]
@@ -247,44 +222,38 @@ async def _scan_vertical(
     ba_spread    = greeks["ask"] - greeks["bid"]
 
     pop = compute_pop(price, sell_strike, dte, greeks["iv"], option_type)
+    logger.info(
+        f"{symbol}: spread {sell_strike}/{buy_strike} "
+        f"width=${spread_width:.1f} credit=${net_credit:.2f} "
+        f"ratio={credit_ratio:.0%} pop={pop:.0%} dte={dte}"
+    )
 
     if decision.structure == "credit":
         result = check_credit_spread(
-            credit         = net_credit,
-            width          = spread_width,
-            pop            = pop,
-            bid_ask_spread = ba_spread,
-            mid_price      = greeks["mid"],
-            short_delta    = greeks["delta"],
-            dte            = dte,
-            open_interest  = greeks.get("oi", 999),
-            symbol         = symbol,
-            vix_regime     = regime,
+            credit=net_credit, width=spread_width, pop=pop,
+            bid_ask_spread=ba_spread, mid_price=greeks["mid"],
+            short_delta=greeks["delta"], dte=dte,
+            open_interest=greeks.get("oi", 999),
+            symbol=symbol, vix_regime=regime,
         )
     else:
         result = check_debit_spread(
-            debit          = net_credit,
-            width          = spread_width,
-            pop            = pop,
-            bid_ask_spread = ba_spread,
-            mid_price      = greeks["mid"],
-            long_delta     = greeks["delta"],
-            dte            = dte,
-            open_interest  = greeks.get("oi", 999),
-            symbol         = symbol,
-            vix_regime     = regime,
+            debit=net_credit, width=spread_width, pop=pop,
+            bid_ask_spread=ba_spread, mid_price=greeks["mid"],
+            long_delta=greeks["delta"], dte=dte,
+            open_interest=greeks.get("oi", 999),
+            symbol=symbol, vix_regime=regime,
         )
 
     if not result.passed:
-        logger.info(f"{symbol}: filtered — {'; '.join(result.reasons)}")
+        logger.info(f"{symbol}: REJECTED — {'; '.join(result.reasons)}")
         return
 
     sizing = compute_position_size(
-        account_size = ACCOUNT_SIZE,
-        max_loss     = max_loss * 100,
-        vix_regime   = regime,
+        account_size=ACCOUNT_SIZE,
+        max_loss=max_loss * 100,
+        vix_regime=regime,
     )
-
     exits = credit_exits(net_credit) if decision.structure == "credit" \
             else debit_exits(net_credit)
 
@@ -298,44 +267,26 @@ async def _scan_vertical(
     )
 
     payload = SignalPayload(
-        symbol             = symbol,
-        direction          = decision.direction,
-        strategy           = decision.strategy,
-        structure          = decision.structure,
-        vix                = vix,
-        vix_regime         = regime,
-        timestamp_et       = now_et,
-        sell_strike        = sell_strike,
-        buy_strike         = buy_strike,
-        expiry             = expiry,
-        dte                = dte,
-        credit_debit       = net_credit,
-        max_loss           = max_loss,
-        ivr                = ivr,
-        credit_width_ratio = credit_ratio,
-        bid_ask_spread     = ba_spread,
-        mid_price          = greeks["mid"],
-        delta              = greeks["delta"],
-        gamma              = greeks.get("gamma", 0.0),
-        theta              = greeks.get("theta", 0.0),
-        vega               = greeks.get("vega",  0.0),
-        iv                 = greeks["iv"],
-        open_interest      = greeks.get("oi", 0),
-        pop                = pop,
-        contracts          = sizing["contracts"],
-        risk_dollars       = sizing["risk_dollars"],
-        risk_pct           = sizing["risk_pct"],
-        stop_level         = exits.get("stop_debit", exits.get("stop_value", 0)),
-        profit_target      = exits["profit_target"],
-        stop_note          = exits["stop_note"],
-        target_note        = exits["target_note"],
-        rationale          = rationale,
-        rvol               = rvol,
-        warnings           = result.warnings,
+        symbol=symbol, direction=decision.direction,
+        strategy=decision.strategy, structure=decision.structure,
+        vix=vix, vix_regime=regime, timestamp_et=now_et,
+        sell_strike=sell_strike, buy_strike=buy_strike,
+        expiry=expiry, dte=dte,
+        credit_debit=net_credit, max_loss=max_loss,
+        ivr=ivr, credit_width_ratio=credit_ratio,
+        bid_ask_spread=ba_spread, mid_price=greeks["mid"],
+        delta=greeks["delta"], gamma=greeks.get("gamma", 0.0),
+        theta=greeks.get("theta", 0.0), vega=greeks.get("vega", 0.0),
+        iv=greeks["iv"], open_interest=greeks.get("oi", 0),
+        pop=pop, contracts=sizing["contracts"],
+        risk_dollars=sizing["risk_dollars"], risk_pct=sizing["risk_pct"],
+        stop_level=exits.get("stop_debit", exits.get("stop_value", 0)),
+        profit_target=exits["profit_target"],
+        stop_note=exits["stop_note"], target_note=exits["target_note"],
+        rationale=rationale, rvol=rvol, warnings=result.warnings,
     )
 
     await send_signal(format_signal(payload))
-
     await log_signal({
         "symbol":       symbol,
         "strategy":     decision.strategy,
@@ -355,7 +306,7 @@ async def _scan_vertical(
         "pop":          pop,
         "delta":        greeks["delta"],
         "theta":        greeks.get("theta", 0.0),
-        "vega":         greeks.get("vega",  0.0),
+        "vega":         greeks.get("vega", 0.0),
         "iv":           greeks["iv"],
         "contracts":    sizing["contracts"],
         "risk_dollars": sizing["risk_dollars"],
@@ -364,26 +315,25 @@ async def _scan_vertical(
         "rationale":    rationale,
         "timestamp_et": now_et,
     })
-
-    logger.info(
-        f"{symbol}: signal sent — "
-        f"{sell_strike}/{buy_strike} "
-        f"credit=${net_credit:.2f} ratio={credit_ratio:.0%} ✓"
-    )
+    logger.info(f"{symbol}: SIGNAL SENT ✓ {sell_strike}/{buy_strike} credit=${net_credit:.2f}")
 
 
 async def scan_ticker(symbol: str, vix: float, regime: str) -> None:
-    """Full signal pipeline for one ticker."""
     try:
+        # 1. Bars
         df = await fetch_intraday_bars(symbol)
         if df.empty or len(df) < 5:
-            logger.info(f"{symbol}: insufficient bar data")
+            logger.info(f"{symbol}: SKIP — only {len(df)} bars available (need 5+)")
             return
 
+        # 2. RVOL
         avg_vol = await fetch_avg_volume(symbol)
         rvol    = compute_rvol(df, avg_vol)
-        ind     = run_all(df)
+
+        # 3. Indicators — pass symbol for logging
+        ind = run_all(df, symbol=symbol)
         if not ind:
+            logger.info(f"{symbol}: SKIP — indicators returned empty")
             return
 
         direction = ind["direction"]
@@ -393,16 +343,22 @@ async def scan_ticker(symbol: str, vix: float, regime: str) -> None:
         now_et    = datetime.now(ET).strftime("%H:%M ET")
 
         logger.info(
-            f"{symbol}: price={price:.2f} vwap={vwap:.2f} "
-            f"direction={direction} ivr={ivr:.0f} rvol={rvol}"
+            f"{symbol}: IVR={ivr:.0f} direction={direction} "
+            f"rvol={rvol:.1f}x regime={regime}"
         )
 
+        # 4. Strategy
         decision = select_strategy(direction, ivr, regime)
+        logger.info(
+            f"{symbol}: strategy={decision.strategy} "
+            f"structure={decision.structure}"
+        )
 
         if decision.strategy == "no_trade":
-            logger.info(f"{symbol}: no_trade")
+            logger.info(f"{symbol}: SKIP — {decision.rationale}")
             return
 
+        # 5. Route to IC or vertical
         if decision.strategy == "iron_condor":
             await _scan_iron_condor(
                 symbol, vix, regime, ivr, price, vwap, rvol, ind, now_et
@@ -414,19 +370,20 @@ async def scan_ticker(symbol: str, vix: float, regime: str) -> None:
             )
 
     except Exception as e:
-        logger.error(f"{symbol}: scan error — {e}", exc_info=True)
+        logger.error(f"{symbol}: SCAN ERROR — {e}", exc_info=True)
 
 
 async def run_scan() -> None:
-    logger.info("=" * 50)
-    logger.info("Scan started")
+    logger.info("=" * 60)
+    logger.info("SCAN STARTED")
 
     vix    = await get_vix()
     regime = classify_vix(vix)
-    logger.info(f"VIX {vix:.1f} — regime: {regime}")
+    logger.info(f"VIX={vix:.1f} regime={regime}")
 
     if regime == "pause":
         await send_warning(format_vix_warning(vix, regime))
+        logger.info("VIX pause — standing down")
         return
 
     warning = format_vix_warning(vix, regime)
@@ -434,10 +391,12 @@ async def run_scan() -> None:
         await send_warning(warning)
 
     symbols = INDEX_ONLY if regime == "spike" else ALL_SYMBOLS
+    logger.info(f"Scanning {len(symbols)} symbols: {symbols}")
+
     await asyncio.gather(*[scan_ticker(s, vix, regime) for s in symbols])
 
-    logger.info("Scan complete")
-    logger.info("=" * 50)
+    logger.info("SCAN COMPLETE")
+    logger.info("=" * 60)
 
 
 async def schedule_loop() -> None:
@@ -461,10 +420,10 @@ async def main() -> None:
     async with tg_app:
         await tg_app.start()
         await tg_app.updater.start_polling(
-            drop_pending_updates = True,
-            allowed_updates      = Update.ALL_TYPES,
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
         )
-        logger.info("Telegram bot listening for commands")
+        logger.info("Telegram bot listening")
         await schedule_loop()
 
 
