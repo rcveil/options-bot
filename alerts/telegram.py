@@ -1,8 +1,8 @@
 """
 alerts/telegram.py
 Telegram bot sender and command handlers.
-Compatible with python-telegram-bot v21.
-Commands: /check SYMBOL  /status  /help  /test
+Commands: /check /status /help /test /scan
+/scan triggers the full scan immediately — useful for testing outside 09:30 ET.
 """
 
 import logging
@@ -16,7 +16,6 @@ logger = logging.getLogger(__name__)
 
 
 async def send_signal(message: str) -> None:
-    """Send a formatted HTML signal alert."""
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     async with bot:
         try:
@@ -31,12 +30,10 @@ async def send_signal(message: str) -> None:
 
 
 async def send_warning(message: str) -> None:
-    """Send a VIX regime warning."""
     await send_signal(message)
 
 
 async def send_text(message: str) -> None:
-    """Send plain text (no HTML)."""
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     async with bot:
         try:
@@ -49,17 +46,12 @@ async def send_text(message: str) -> None:
 
 
 def build_application() -> Application:
-    """
-    Build the Telegram Application with all command handlers.
-    Uses ApplicationBuilder — updater is created automatically.
-    Do NOT call initialize() or start() here — that is done in main.py
-    inside the async context manager.
-    """
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("check",  handle_check))
     app.add_handler(CommandHandler("status", handle_status))
     app.add_handler(CommandHandler("help",   handle_help))
     app.add_handler(CommandHandler("test",   handle_test))
+    app.add_handler(CommandHandler("scan",   handle_scan))
     return app
 
 
@@ -67,31 +59,32 @@ async def handle_check(
     update:  Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """/check SYMBOL — re-evaluate latest signal for a ticker."""
     if not context.args:
         await update.message.reply_text(
             "Usage: /check SYMBOL\nExample: /check NVDA"
         )
         return
-
     symbol = context.args[0].upper()
-    await update.message.reply_text(
-        f"Re-evaluating latest signal for {symbol}..."
-    )
-
+    await update.message.reply_text(f"Re-evaluating {symbol}...")
     try:
         from alerts.late_entry import evaluate_late_entry
         result = await evaluate_late_entry(symbol)
         await update.message.reply_text(result, parse_mode=ParseMode.HTML)
     except Exception as e:
-        await update.message.reply_text(f"Error checking {symbol}: {e}")
+        await update.message.reply_text(f"Error: {e}")
 
 
 async def handle_status(
     update:  Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """/status — show bot health and VIX regime."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from config.settings import TIMEZONE
+
+    ET  = ZoneInfo(TIMEZONE)
+    now = datetime.now(ET)
+
     try:
         from data.market import get_vix, classify_vix
         vix    = await get_vix()
@@ -102,13 +95,15 @@ async def handle_status(
 
     await update.message.reply_text(
         f"✅ Bot running\n"
+        f"Server time: {now.strftime('%A %H:%M %Z')}\n"
         f"{vix_line}\n\n"
         f"Watchlist:\n"
         f"Semicon: MU AVGO STX AMD NVDA\n"
         f"Metals:  GLD SLV\n"
         f"Tech:    MSFT GOOGL AMZN AAPL\n"
         f"Index:   SPX SPY QQQ\n\n"
-        f"Next scan: weekdays at 09:30 ET (21:30 SGT)"
+        f"Next scan: weekdays at 09:30 ET (21:30 SGT)\n"
+        f"Use /scan to trigger immediately"
     )
 
 
@@ -116,11 +111,11 @@ async def handle_help(
     update:  Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """/help — list available commands."""
     await update.message.reply_text(
         "/check SYMBOL  —  re-evaluate latest signal\n"
-        "/status        —  bot health and VIX level\n"
+        "/status        —  bot health, VIX, server time\n"
         "/test          —  test Tastytrade connection\n"
+        "/scan          —  trigger full scan NOW\n"
         "/help          —  this message"
     )
 
@@ -129,28 +124,23 @@ async def handle_test(
     update:  Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """/test — verify Tastytrade connection and live data."""
-    await update.message.reply_text("Running connection test, please wait...")
-
+    await update.message.reply_text("Running connection test...")
     results = []
 
-    # Test 1: Session
     try:
         from data.tastytrade import get_session
         await get_session()
-        results.append("✅ Session — logged in successfully")
+        results.append("✅ Session — logged in")
     except Exception as e:
         results.append(f"❌ Session — {str(e)[:80]}")
 
-    # Test 2: Live quote
     try:
         from data.tastytrade import get_quote
-        quote = await get_quote("SPY")
-        results.append(f"✅ Quote — SPY mid ${quote['mid']:.2f}")
+        q = await get_quote("SPY")
+        results.append(f"✅ Quote — SPY ${q['mid']:.2f}")
     except Exception as e:
         results.append(f"❌ Quote — {str(e)[:80]}")
 
-    # Test 3: VIX
     try:
         from data.market import get_vix, classify_vix
         vix    = await get_vix()
@@ -159,7 +149,6 @@ async def handle_test(
     except Exception as e:
         results.append(f"❌ VIX — {str(e)[:80]}")
 
-    # Test 4: IVR
     try:
         from data.market import get_ivr
         ivr = await get_ivr("AAPL")
@@ -167,7 +156,6 @@ async def handle_test(
     except Exception as e:
         results.append(f"❌ IVR — {str(e)[:80]}")
 
-    # Test 5: Option chain
     try:
         from signals.chain import select_expiry
         from config.thresholds import DTE_CREDIT_MIN, DTE_CREDIT_MAX
@@ -175,19 +163,33 @@ async def handle_test(
         if expiry:
             results.append(f"✅ Chain — AAPL expiry {expiry}")
         else:
-            results.append(
-                "⚠️ Chain — no expiry in DTE range "
-                "(normal if market closed)"
-            )
+            results.append("⚠️ Chain — no expiry in DTE range")
     except Exception as e:
         results.append(f"❌ Chain — {str(e)[:80]}")
 
-    summary = (
+    await update.message.reply_text(
         "Connection test results\n"
         "─────────────────────\n"
         + "\n".join(results)
         + "\n─────────────────────\n"
-        "Tests 2–5 may show errors outside market hours.\n"
-        "Test 1 (Session) is the critical one."
+        "Tests 2–5 may fail outside market hours."
     )
-    await update.message.reply_text(summary)
+
+
+async def handle_scan(
+    update:  Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """/scan — trigger the full scan immediately."""
+    await update.message.reply_text(
+        "🔍 Manual scan triggered. Check logs for progress.\n"
+        "Signals will arrive in this chat if any pass all filters."
+    )
+    try:
+        # Import here to avoid circular import
+        from main import run_scan
+        await run_scan()
+        await update.message.reply_text("✅ Scan complete.")
+    except Exception as e:
+        logger.error(f"/scan error: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Scan error: {e}")
