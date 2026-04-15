@@ -1,13 +1,17 @@
 """
 main.py
 Scheduler and main scan loop.
-Handles vertical spreads and iron condors.
-Detailed INFO logging at every stage so you can see why signals fire or not.
+Uses pure async time checking instead of the schedule library.
+schedule.do() + asyncio.create_task() does not work reliably —
+the callback fires in a sync context with no running loop.
+
+Fix: a simple async loop checks the time every 30 seconds and
+fires run_scan() directly via asyncio when it matches 09:30 ET
+on a weekday. No external scheduler library needed.
 """
 
 import asyncio
 import logging
-import schedule
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -42,6 +46,14 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 ET     = ZoneInfo(TIMEZONE)
 
+# Scan fires at this time ET on weekdays
+SCAN_HOUR   = 9
+SCAN_MINUTE = 30
+
+# Track whether we already fired the scan this session
+# Prevents double-firing if the loop ticks twice in the same minute
+_last_scan_date: str = ""
+
 
 async def _scan_iron_condor(
     symbol: str, vix: float, regime: str, ivr: float,
@@ -58,10 +70,10 @@ async def _scan_iron_condor(
     put_g  = ic["put_greeks"]
     call_g = ic["call_greeks"]
 
-    put_pop  = compute_pop(price, ic["put_sell_strike"],
-                           ic["dte"], put_g["iv"],  "P")
-    call_pop = compute_pop(price, ic["call_sell_strike"],
-                           ic["dte"], call_g["iv"], "C")
+    put_pop      = compute_pop(price, ic["put_sell_strike"],
+                               ic["dte"], put_g["iv"],  "P")
+    call_pop     = compute_pop(price, ic["call_sell_strike"],
+                               ic["dte"], call_g["iv"], "C")
     combined_pop = round(put_pop * call_pop, 4)
 
     logger.info(
@@ -89,9 +101,7 @@ async def _scan_iron_condor(
     )
 
     if not result.passed:
-        logger.info(
-            f"{symbol} IC: REJECTED — {'; '.join(result.reasons)}"
-        )
+        logger.info(f"{symbol} IC: REJECTED — {'; '.join(result.reasons)}")
         return
 
     sizing = compute_position_size(
@@ -108,61 +118,41 @@ async def _scan_iron_condor(
     )
 
     payload = SignalPayload(
-        symbol             = symbol,
-        direction          = "neutral",
-        strategy           = "iron_condor",
-        structure          = "credit",
-        vix                = vix,
-        vix_regime         = regime,
-        timestamp_et       = now_et,
-        sell_strike        = ic["put_sell_strike"],
-        buy_strike         = ic["put_buy_strike"],
-        expiry             = ic["expiry"],
-        dte                = ic["dte"],
-        credit_debit       = ic["total_credit"],
-        max_loss           = ic["max_loss"],
-        put_sell_strike    = ic["put_sell_strike"],
-        put_buy_strike     = ic["put_buy_strike"],
-        put_credit         = ic["put_credit"],
-        put_credit_ratio   = ic["put_credit_ratio"],
-        call_sell_strike   = ic["call_sell_strike"],
-        call_buy_strike    = ic["call_buy_strike"],
-        call_credit        = ic["call_credit"],
-        call_credit_ratio  = ic["call_credit_ratio"],
-        wing_width         = ic["wing_width"],
-        ivr                = ivr,
-        credit_width_ratio = min(ic["put_credit_ratio"], ic["call_credit_ratio"]),
-        bid_ask_spread     = put_g["ask"] - put_g["bid"],
-        mid_price          = put_g["mid"],
-        delta              = put_g["delta"],
-        gamma              = put_g.get("gamma", 0.0),
-        theta              = put_g.get("theta", 0.0),
-        vega               = put_g.get("vega",  0.0),
-        iv                 = put_g["iv"],
-        open_interest      = put_g.get("oi", 0),
-        pop                = combined_pop,
-        contracts          = sizing["contracts"],
-        risk_dollars       = sizing["risk_dollars"],
-        risk_pct           = sizing["risk_pct"],
-        stop_level         = exits["stop_debit"],
-        profit_target      = exits["profit_target"],
-        stop_note          = exits["stop_note"],
-        target_note        = exits["target_note"],
-        rationale          = rationale,
-        rvol               = rvol,
-        warnings           = result.warnings,
+        symbol=symbol, direction="neutral",
+        strategy="iron_condor", structure="credit",
+        vix=vix, vix_regime=regime, timestamp_et=now_et,
+        sell_strike=ic["put_sell_strike"], buy_strike=ic["put_buy_strike"],
+        expiry=ic["expiry"], dte=ic["dte"],
+        credit_debit=ic["total_credit"], max_loss=ic["max_loss"],
+        put_sell_strike=ic["put_sell_strike"],
+        put_buy_strike=ic["put_buy_strike"],
+        put_credit=ic["put_credit"],
+        put_credit_ratio=ic["put_credit_ratio"],
+        call_sell_strike=ic["call_sell_strike"],
+        call_buy_strike=ic["call_buy_strike"],
+        call_credit=ic["call_credit"],
+        call_credit_ratio=ic["call_credit_ratio"],
+        wing_width=ic["wing_width"],
+        ivr=ivr,
+        credit_width_ratio=min(ic["put_credit_ratio"], ic["call_credit_ratio"]),
+        bid_ask_spread=put_g["ask"] - put_g["bid"],
+        mid_price=put_g["mid"],
+        delta=put_g["delta"], gamma=put_g.get("gamma", 0.0),
+        theta=put_g.get("theta", 0.0), vega=put_g.get("vega", 0.0),
+        iv=put_g["iv"], open_interest=put_g.get("oi", 0),
+        pop=combined_pop, contracts=sizing["contracts"],
+        risk_dollars=sizing["risk_dollars"], risk_pct=sizing["risk_pct"],
+        stop_level=exits["stop_debit"], profit_target=exits["profit_target"],
+        stop_note=exits["stop_note"], target_note=exits["target_note"],
+        rationale=rationale, rvol=rvol, warnings=result.warnings,
     )
 
     await send_signal(format_signal(payload))
     await log_signal({
-        "symbol":            symbol,
-        "strategy":          "iron_condor",
-        "direction":         "neutral",
-        "structure":         "credit",
-        "sell_strike":       None,
-        "buy_strike":        None,
-        "spread_width":      None,
-        "option_type":       None,
+        "symbol": symbol, "strategy": "iron_condor",
+        "direction": "neutral", "structure": "credit",
+        "sell_strike": None, "buy_strike": None,
+        "spread_width": None, "option_type": None,
         "put_sell_strike":   ic["put_sell_strike"],
         "put_buy_strike":    ic["put_buy_strike"],
         "put_credit":        ic["put_credit"],
@@ -172,26 +162,17 @@ async def _scan_iron_condor(
         "call_credit":       ic["call_credit"],
         "call_credit_ratio": ic["call_credit_ratio"],
         "wing_width":        ic["wing_width"],
-        "expiry":            ic["expiry"],
-        "dte":               ic["dte"],
-        "credit_debit":      ic["total_credit"],
-        "max_loss":          ic["max_loss"],
-        "ivr":               ivr,
-        "vix":               vix,
-        "vix_regime":        regime,
-        "pop":               combined_pop,
-        "delta":             put_g["delta"],
-        "theta":             put_g.get("theta", 0.0),
-        "vega":              put_g.get("vega",  0.0),
-        "iv":                put_g["iv"],
-        "contracts":         sizing["contracts"],
-        "risk_dollars":      sizing["risk_dollars"],
-        "vwap":              vwap,
-        "rvol":              rvol,
-        "rationale":         rationale,
-        "timestamp_et":      now_et,
+        "expiry": ic["expiry"], "dte": ic["dte"],
+        "credit_debit": ic["total_credit"], "max_loss": ic["max_loss"],
+        "ivr": ivr, "vix": vix, "vix_regime": regime,
+        "pop": combined_pop, "delta": put_g["delta"],
+        "theta": put_g.get("theta", 0.0), "vega": put_g.get("vega", 0.0),
+        "iv": put_g["iv"], "contracts": sizing["contracts"],
+        "risk_dollars": sizing["risk_dollars"],
+        "vwap": vwap, "rvol": rvol,
+        "rationale": rationale, "timestamp_et": now_et,
     })
-    logger.info(f"{symbol} IC: signal sent ✓")
+    logger.info(f"{symbol} IC: SIGNAL SENT ✓")
 
 
 async def _scan_vertical(
@@ -288,52 +269,38 @@ async def _scan_vertical(
 
     await send_signal(format_signal(payload))
     await log_signal({
-        "symbol":       symbol,
-        "strategy":     decision.strategy,
-        "direction":    decision.direction,
-        "structure":    decision.structure,
-        "sell_strike":  sell_strike,
-        "buy_strike":   buy_strike,
-        "spread_width": spread_width,
-        "option_type":  option_type,
-        "expiry":       expiry,
-        "dte":          dte,
-        "credit_debit": net_credit,
-        "max_loss":     max_loss,
-        "ivr":          ivr,
-        "vix":          vix,
-        "vix_regime":   regime,
-        "pop":          pop,
-        "delta":        greeks["delta"],
-        "theta":        greeks.get("theta", 0.0),
-        "vega":         greeks.get("vega", 0.0),
-        "iv":           greeks["iv"],
-        "contracts":    sizing["contracts"],
+        "symbol": symbol, "strategy": decision.strategy,
+        "direction": decision.direction, "structure": decision.structure,
+        "sell_strike": sell_strike, "buy_strike": buy_strike,
+        "spread_width": spread_width, "option_type": option_type,
+        "expiry": expiry, "dte": dte,
+        "credit_debit": net_credit, "max_loss": max_loss,
+        "ivr": ivr, "vix": vix, "vix_regime": regime,
+        "pop": pop, "delta": greeks["delta"],
+        "theta": greeks.get("theta", 0.0), "vega": greeks.get("vega", 0.0),
+        "iv": greeks["iv"], "contracts": sizing["contracts"],
         "risk_dollars": sizing["risk_dollars"],
-        "vwap":         vwap,
-        "rvol":         rvol,
-        "rationale":    rationale,
-        "timestamp_et": now_et,
+        "vwap": vwap, "rvol": rvol,
+        "rationale": rationale, "timestamp_et": now_et,
     })
-    logger.info(f"{symbol}: SIGNAL SENT ✓ {sell_strike}/{buy_strike} credit=${net_credit:.2f}")
+    logger.info(
+        f"{symbol}: SIGNAL SENT ✓ {sell_strike}/{buy_strike} "
+        f"credit=${net_credit:.2f}"
+    )
 
 
 async def scan_ticker(symbol: str, vix: float, regime: str) -> None:
     try:
-        # 1. Bars
         df = await fetch_intraday_bars(symbol)
         if df.empty or len(df) < 5:
-            logger.info(f"{symbol}: SKIP — only {len(df)} bars available (need 5+)")
+            logger.info(f"{symbol}: SKIP — only {len(df)} bars (need 5+)")
             return
 
-        # 2. RVOL
-        avg_vol = await fetch_avg_volume(symbol)
-        rvol    = compute_rvol(df, avg_vol)
-
-        # 3. Indicators — pass symbol for logging
-        ind = run_all(df, symbol=symbol)
+        avg_vol   = await fetch_avg_volume(symbol)
+        rvol      = compute_rvol(df, avg_vol)
+        ind       = run_all(df, symbol=symbol)
         if not ind:
-            logger.info(f"{symbol}: SKIP — indicators returned empty")
+            logger.info(f"{symbol}: SKIP — indicators empty")
             return
 
         direction = ind["direction"]
@@ -347,7 +314,6 @@ async def scan_ticker(symbol: str, vix: float, regime: str) -> None:
             f"rvol={rvol:.1f}x regime={regime}"
         )
 
-        # 4. Strategy
         decision = select_strategy(direction, ivr, regime)
         logger.info(
             f"{symbol}: strategy={decision.strategy} "
@@ -358,7 +324,6 @@ async def scan_ticker(symbol: str, vix: float, regime: str) -> None:
             logger.info(f"{symbol}: SKIP — {decision.rationale}")
             return
 
-        # 5. Route to IC or vertical
         if decision.strategy == "iron_condor":
             await _scan_iron_condor(
                 symbol, vix, regime, ivr, price, vwap, rvol, ind, now_et
@@ -374,16 +339,33 @@ async def scan_ticker(symbol: str, vix: float, regime: str) -> None:
 
 
 async def run_scan() -> None:
-    logger.info("=" * 60)
-    logger.info("SCAN STARTED")
+    global _last_scan_date
 
-    vix    = await get_vix()
-    regime = classify_vix(vix)
-    logger.info(f"VIX={vix:.1f} regime={regime}")
+    now    = datetime.now(ET)
+    today  = now.strftime("%Y-%m-%d")
+
+    # Guard: only fire once per day
+    if _last_scan_date == today:
+        logger.info("Scan already ran today — skipping duplicate trigger")
+        return
+    _last_scan_date = today
+
+    logger.info("=" * 60)
+    logger.info(f"SCAN STARTED at {now.strftime('%H:%M:%S')} ET")
+
+    try:
+        vix    = await get_vix()
+        regime = classify_vix(vix)
+        logger.info(f"VIX={vix:.1f} regime={regime}")
+    except Exception as e:
+        logger.error(f"VIX fetch failed: {e} — using default 20.0")
+        vix    = 20.0
+        regime = "elevated"
 
     if regime == "pause":
         await send_warning(format_vix_warning(vix, regime))
         logger.info("VIX pause — standing down")
+        logger.info("=" * 60)
         return
 
     warning = format_vix_warning(vix, regime)
@@ -399,22 +381,38 @@ async def run_scan() -> None:
     logger.info("=" * 60)
 
 
-async def schedule_loop() -> None:
+async def scheduler_loop() -> None:
+    """
+    Pure async scheduler.
+    Checks every 30 seconds if it is time to run the scan.
+    Fires run_scan() directly — no sync callback, no asyncio.create_task hack.
+    """
+    logger.info(
+        f"Scheduler running — will fire at "
+        f"{SCAN_HOUR:02d}:{SCAN_MINUTE:02d} ET on weekdays"
+    )
+
     while True:
-        schedule.run_pending()
+        now = datetime.now(ET)
+
+        is_weekday    = now.weekday() < 5   # Mon=0 … Fri=4
+        is_scan_time  = (now.hour == SCAN_HOUR and now.minute == SCAN_MINUTE)
+
+        if is_weekday and is_scan_time:
+            logger.info(
+                f"Scan trigger: {now.strftime('%A %H:%M')} ET"
+            )
+            await run_scan()
+
         await asyncio.sleep(30)
 
 
 async def main() -> None:
     await init_db()
     logger.info("Database initialised")
-
-    for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
-        getattr(schedule.every(), day).at("09:30").do(
-            lambda: asyncio.create_task(run_scan())
-        )
-
-    logger.info("Scheduler armed — waiting for 09:30 ET on weekdays")
+    logger.info(
+        f"Server time: {datetime.now(ET).strftime('%A %Y-%m-%d %H:%M %Z')}"
+    )
 
     tg_app = build_application()
     async with tg_app:
@@ -424,7 +422,9 @@ async def main() -> None:
             allowed_updates=Update.ALL_TYPES,
         )
         logger.info("Telegram bot listening")
-        await schedule_loop()
+
+        # Run scheduler in same async context — no threads, no schedule library
+        await scheduler_loop()
 
 
 if __name__ == "__main__":
