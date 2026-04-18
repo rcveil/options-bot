@@ -8,7 +8,10 @@ import logging
 from datetime import date
 from typing import Optional
 
-from data.tastytrade import get_session, get_greeks, get_option_chain_strikes
+"from data.tastytrade import get_session, get_greeks, get_option_chain_strikes
+from data.tastytrade import (
+    get_greeks, fetch_option_chain, get_strikes_for_expiry
+)
 from signals.strategy import compute_pop
 from config.thresholds import (
     DELTA_SHORT_CREDIT_MIN, DELTA_SHORT_CREDIT_MAX,
@@ -62,7 +65,7 @@ async def _find_short_strike(
     delta_min = DELTA_SHORT_CREDIT_MIN if structure == "credit" else DELTA_LONG_DEBIT_MIN
     delta_max = DELTA_SHORT_CREDIT_MAX if structure == "credit" else DELTA_LONG_DEBIT_MAX
 
-    strikes_data = await get_option_chain_strikes(symbol, expiry)
+    strikes_data = await get_strikes_for_expiry(symbol, expiry)
     if not strikes_data:
         logger.warning(f"{symbol}: empty strike list for {expiry}")
         return None
@@ -243,7 +246,7 @@ async def find_best_spread(
     if short is None:
         return None
 
-    strikes_data = await get_option_chain_strikes(symbol, expiry)
+    strikes_data = await get_strikes_for_expiry(symbol, expiry)
     if not strikes_data:
         return None
 
