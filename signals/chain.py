@@ -200,7 +200,7 @@ async def _build_one_wing(
     if short is None:
         return None
 
-    strikes_data = await get_option_chain_strikes(symbol, expiry)
+    strikes_data = await get_strikes_for_expiry(symbol, expiry)
     if not strikes_data:
         return None
 
