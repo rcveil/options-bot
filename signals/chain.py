@@ -8,7 +8,6 @@ import logging
 from datetime import date
 from typing import Optional
 
-"from data.tastytrade import get_session, get_greeks, get_option_chain_strikes
 from data.tastytrade import (
     get_greeks, fetch_option_chain, get_strikes_for_expiry
 )
