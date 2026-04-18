@@ -1,6 +1,8 @@
 """
 signals/chain.py
-Option chain scanner with detailed INFO logging at every decision point.
+Option chain scanner: best expiry, best spread, iron condor.
+Fetches chain ONCE per symbol then passes it to all strike-finding functions.
+Dynamic spread width — credit >= 33% of width (per-wing for iron condor).
 """
 
 import asyncio
@@ -11,7 +13,6 @@ from typing import Optional
 from data.tastytrade import (
     get_greeks, fetch_option_chain, get_strikes_for_expiry
 )
-from signals.strategy import compute_pop
 from config.thresholds import (
     DELTA_SHORT_CREDIT_MIN, DELTA_SHORT_CREDIT_MAX,
     DELTA_LONG_DEBIT_MIN,   DELTA_LONG_DEBIT_MAX,
@@ -25,49 +26,55 @@ CANDIDATE_WIDTHS = [2.5, 5, 7.5, 10, 12.5, 15, 20, 25]
 MIN_CREDIT_RATIO = 0.33
 
 
-async def select_expiry(symbol: str, dte_min: int, dte_max: int) -> Optional[str]:
-    session = await get_session()
-    try:
-        from tastytrade.instruments import get_option_chain
-        chain = await asyncio.wait_for(
-            get_option_chain(session, symbol), timeout=10.0
-        )
-    except Exception as e:
-        logger.error(f"{symbol}: option chain fetch failed — {e}")
-        return None
-
+def _select_expiry_from_chain(
+    chain:   dict,
+    symbol:  str,
+    dte_min: int,
+    dte_max: int,
+) -> Optional[str]:
+    """Pick nearest expiry within DTE window from a pre-fetched chain."""
     today      = date.today()
     candidates = [
         ((exp - today).days, exp)
         for exp in chain.keys()
         if dte_min <= (exp - today).days <= dte_max
     ]
-
     if not candidates:
         all_dtes = sorted([(exp - today).days for exp in chain.keys()])
         logger.warning(
             f"{symbol}: no expiry in DTE {dte_min}–{dte_max}. "
-            f"Available DTEs: {all_dtes[:8]}"
+            f"Available DTEs: {all_dtes[:10]}"
         )
         return None
-
     candidates.sort(key=lambda x: x[0])
     chosen = candidates[0][1]
     logger.info(f"{symbol}: selected expiry {chosen} ({candidates[0][0]} DTE)")
     return str(chosen)
 
 
+async def select_expiry(
+    symbol:  str,
+    dte_min: int,
+    dte_max: int,
+) -> Optional[str]:
+    """Fetch chain and pick nearest expiry within DTE window."""
+    chain = await fetch_option_chain(symbol)
+    if not chain:
+        return None
+    return _select_expiry_from_chain(chain, symbol, dte_min, dte_max)
+
+
 async def _find_short_strike(
-    symbol: str, expiry: str, option_type: str,
-    structure: str, underlying_price: float,
+    symbol:           str,
+    expiry:           str,
+    option_type:      str,
+    structure:        str,
+    underlying_price: float,
+    strikes_data:     list[dict],
 ) -> Optional[dict]:
+    """Find best short strike by delta from pre-fetched strikes list."""
     delta_min = DELTA_SHORT_CREDIT_MIN if structure == "credit" else DELTA_LONG_DEBIT_MIN
     delta_max = DELTA_SHORT_CREDIT_MAX if structure == "credit" else DELTA_LONG_DEBIT_MAX
-
-    strikes_data = await get_strikes_for_expiry(symbol, expiry)
-    if not strikes_data:
-        logger.warning(f"{symbol}: empty strike list for {expiry}")
-        return None
 
     if option_type == "P":
         candidates = sorted(
@@ -82,8 +89,7 @@ async def _find_short_strike(
 
     logger.info(
         f"{symbol}: scanning {len(candidates)} {option_type} strikes "
-        f"for delta {delta_min}–{delta_max} "
-        f"(underlying={underlying_price:.2f})"
+        f"for delta {delta_min}–{delta_max} (underlying={underlying_price:.2f})"
     )
 
     best            = None
@@ -96,14 +102,11 @@ async def _find_short_strike(
         except Exception as e:
             logger.warning(f"{symbol} strike {sd['strike']}: greeks failed — {e}")
             continue
-
         abs_delta = abs(g["delta"])
         if not (delta_min <= abs_delta <= delta_max):
             continue
         if g["bid"] <= 0:
-            logger.warning(f"{symbol} {sd['strike']}: zero bid — illiquid, skipping")
             continue
-
         diff = abs(abs_delta - target_delta)
         if diff < best_delta_diff:
             best_delta_diff = diff
@@ -111,24 +114,25 @@ async def _find_short_strike(
 
     if best:
         logger.info(
-            f"{symbol}: best short strike {best['strike']} "
-            f"delta={best['greeks']['delta']:.3f} "
-            f"mid=${best['greeks']['mid']:.2f}"
+            f"{symbol}: short strike {best['strike']} "
+            f"delta={best['greeks']['delta']:.3f} mid=${best['greeks']['mid']:.2f}"
         )
     else:
         logger.warning(
-            f"{symbol}: no strike found with delta {delta_min}–{delta_max}. "
-            f"All candidates had wrong delta or zero bid."
+            f"{symbol}: no strike found with delta {delta_min}–{delta_max}"
         )
-
     return best
 
 
 async def _find_long_strike(
-    symbol: str, expiry: str, option_type: str,
-    short_strike: float, short_credit: float,
+    symbol:       str,
+    expiry:       str,
+    option_type:  str,
+    short_strike: float,
+    short_credit: float,
     strikes_data: list[dict],
 ) -> Optional[dict]:
+    """Find narrowest long strike where credit >= 33% of width."""
     available   = sorted([s["strike"] for s in strikes_data])
     best_result = None
 
@@ -138,7 +142,6 @@ async def _find_long_strike(
         closest = min(available, key=lambda x: abs(x - target_long), default=None)
         if closest is None:
             continue
-
         actual_width = abs(short_strike - closest)
         if actual_width < 1.0:
             continue
@@ -150,24 +153,18 @@ async def _find_long_strike(
 
         net_credit = short_credit - long_g["mid"]
         if net_credit <= 0:
-            logger.info(
-                f"{symbol}: width=${actual_width:.1f} — "
-                f"net credit ${net_credit:.2f} negative (long costs more than short)"
-            )
             continue
 
         ratio = net_credit / actual_width
         logger.info(
-            f"{symbol}: width=${actual_width:.1f} "
-            f"short={short_strike} long={closest} "
-            f"credit=${net_credit:.2f} ratio={ratio:.0%} "
-            f"{'✓ PASS' if ratio >= MIN_CREDIT_RATIO else '✗ below 33%'}"
+            f"{symbol}: width=${actual_width:.1f} short={short_strike} "
+            f"long={closest} credit=${net_credit:.2f} ratio={ratio:.0%} "
+            f"{'✓' if ratio >= MIN_CREDIT_RATIO else '✗'}"
         )
 
         result = {
             "long_strike":  closest,
             "spread_width": actual_width,
-            "long_greeks":  long_g,
             "net_credit":   round(net_credit, 2),
             "credit_ratio": round(ratio, 4),
         }
@@ -181,32 +178,32 @@ async def _find_long_strike(
     if best_result:
         logger.warning(
             f"{symbol}: best ratio {best_result['credit_ratio']:.0%} "
-            f"did not reach 33% — filters.py will reject. "
-            f"Consider that IV may be too low for a credit spread today."
+            f"below 33% — filters.py will reject"
         )
-    else:
-        logger.warning(f"{symbol}: no long strike candidates found at any width")
-
     return best_result
 
 
 async def _build_one_wing(
-    symbol: str, expiry: str, option_type: str, underlying_price: float,
+    symbol:           str,
+    expiry:           str,
+    option_type:      str,
+    underlying_price: float,
+    strikes_data:     list[dict],
 ) -> Optional[dict]:
+    """Build one wing of an iron condor from pre-fetched strikes."""
     logger.info(f"{symbol}: building {option_type} wing for {expiry}")
+
     short = await _find_short_strike(
-        symbol, expiry, option_type, "credit", underlying_price
+        symbol, expiry, option_type, "credit",
+        underlying_price, strikes_data,
     )
     if short is None:
         return None
 
-    strikes_data = await get_strikes_for_expiry(symbol, expiry)
-    if not strikes_data:
-        return None
-
     long_result = await _find_long_strike(
         symbol, expiry, option_type,
-        short["strike"], short["greeks"]["mid"], strikes_data,
+        short["strike"], short["greeks"]["mid"],
+        strikes_data,
     )
     if long_result is None:
         return None
@@ -229,29 +226,34 @@ async def _build_one_wing(
 
 
 async def find_best_spread(
-    symbol: str, expiry: str, option_type: str,
-    structure: str, direction: str, underlying_price: float,
+    symbol:           str,
+    expiry:           str,
+    option_type:      str,
+    structure:        str,
+    direction:        str,
+    underlying_price: float,
+    strikes_data:     list[dict],
 ) -> Optional[dict]:
+    """Build a single vertical spread from pre-fetched strikes."""
     logger.info(
         f"{symbol}: finding {structure} {option_type} spread "
         f"for {expiry} (direction={direction})"
     )
+
     today = date.today()
     dte   = (date.fromisoformat(expiry) - today).days
 
     short = await _find_short_strike(
-        symbol, expiry, option_type, structure, underlying_price
+        symbol, expiry, option_type, structure,
+        underlying_price, strikes_data,
     )
     if short is None:
         return None
 
-    strikes_data = await get_strikes_for_expiry(symbol, expiry)
-    if not strikes_data:
-        return None
-
     long_result = await _find_long_strike(
         symbol, expiry, option_type,
-        short["strike"], short["greeks"]["mid"], strikes_data,
+        short["strike"], short["greeks"]["mid"],
+        strikes_data,
     )
     if long_result is None:
         return None
@@ -259,10 +261,10 @@ async def find_best_spread(
     spread_width = long_result["spread_width"]
     net_credit   = long_result["net_credit"]
     credit_ratio = long_result["credit_ratio"]
-    max_loss     = spread_width - net_credit
+    max_loss     = round(spread_width - net_credit, 2)
 
     logger.info(
-        f"{symbol}: final spread {short['strike']}/{long_result['long_strike']} "
+        f"{symbol}: spread {short['strike']}/{long_result['long_strike']} "
         f"width=${spread_width:.1f} credit=${net_credit:.2f} "
         f"ratio={credit_ratio:.0%} max_loss=${max_loss:.2f}"
     )
@@ -273,7 +275,7 @@ async def find_best_spread(
         "spread_width":  spread_width,
         "net_credit":    net_credit,
         "credit_ratio":  credit_ratio,
-        "max_loss":      round(max_loss, 2),
+        "max_loss":      max_loss,
         "greeks":        short["greeks"],
         "expiry":        expiry,
         "dte":           dte,
@@ -281,24 +283,42 @@ async def find_best_spread(
 
 
 async def build_iron_condor(
-    symbol: str, underlying_price: float,
-    dte_min: int, dte_max: int,
+    symbol:           str,
+    underlying_price: float,
+    dte_min:          int,
+    dte_max:          int,
 ) -> Optional[dict]:
+    """
+    Build symmetric iron condor — one chain fetch, both wings.
+    Per-wing 1/3 credit rule applied independently.
+    """
     logger.info(f"{symbol}: building iron condor (underlying={underlying_price:.2f})")
-    expiry = await select_expiry(symbol, dte_min, dte_max)
+
+    # Single chain fetch for the whole condor
+    chain = await fetch_option_chain(symbol)
+    if not chain:
+        return None
+
+    expiry = _select_expiry_from_chain(chain, symbol, dte_min, dte_max)
     if not expiry:
         return None
 
+    strikes_data = get_strikes_for_expiry(chain, expiry, symbol)
+    if not strikes_data:
+        logger.warning(f"{symbol} IC: no strikes for {expiry}")
+        return None
+
+    # Build both wings concurrently using the same strikes_data
     put_wing, call_wing = await asyncio.gather(
-        _build_one_wing(symbol, expiry, "P", underlying_price),
-        _build_one_wing(symbol, expiry, "C", underlying_price),
+        _build_one_wing(symbol, expiry, "P", underlying_price, strikes_data),
+        _build_one_wing(symbol, expiry, "C", underlying_price, strikes_data),
     )
 
     if put_wing is None:
-        logger.warning(f"{symbol} IC: put wing returned None — skipping condor")
+        logger.warning(f"{symbol} IC: put wing failed")
         return None
     if call_wing is None:
-        logger.warning(f"{symbol} IC: call wing returned None — skipping condor")
+        logger.warning(f"{symbol} IC: call wing failed")
         return None
 
     today        = date.today()
@@ -308,12 +328,11 @@ async def build_iron_condor(
     max_loss     = round(wing_width - total_credit, 2)
 
     logger.info(
-        f"{symbol} IC: "
-        f"put {put_wing['sell_strike']}/{put_wing['buy_strike']} "
+        f"{symbol} IC: put {put_wing['sell_strike']}/{put_wing['buy_strike']} "
         f"({put_wing['credit_ratio']:.0%}) | "
         f"call {call_wing['sell_strike']}/{call_wing['buy_strike']} "
         f"({call_wing['credit_ratio']:.0%}) | "
-        f"total=${total_credit:.2f} max_loss=${max_loss:.2f}"
+        f"total=${total_credit:.2f}"
     )
 
     return {
@@ -338,18 +357,36 @@ async def build_iron_condor(
 
 
 async def build_spread(
-    symbol: str, structure: str, direction: str,
-    underlying_price: float, dte_min: int, dte_max: int,
+    symbol:           str,
+    structure:        str,
+    direction:        str,
+    underlying_price: float,
+    dte_min:          int,
+    dte_max:          int,
 ) -> Optional[dict]:
+    """Entry point for single vertical spreads from main.py."""
     option_type = (
         "P" if structure == "credit" and direction == "bullish" else
         "C" if structure == "credit" and direction == "bearish" else
         "C" if structure == "debit"  and direction == "bullish" else
         "P"
     )
-    expiry = await select_expiry(symbol, dte_min, dte_max)
+
+    # Single chain fetch for this spread
+    chain = await fetch_option_chain(symbol)
+    if not chain:
+        return None
+
+    expiry = _select_expiry_from_chain(chain, symbol, dte_min, dte_max)
     if not expiry:
         return None
+
+    strikes_data = get_strikes_for_expiry(chain, expiry, symbol)
+    if not strikes_data:
+        logger.warning(f"{symbol}: no strikes for {expiry}")
+        return None
+
     return await find_best_spread(
-        symbol, expiry, option_type, structure, direction, underlying_price
+        symbol, expiry, option_type, structure,
+        direction, underlying_price, strikes_data,
     )
