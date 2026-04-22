@@ -1,7 +1,13 @@
 """
 signals/indicators.py
 Computes all technical indicators from 1-min OHLCV bars.
-Logs every indicator value and direction decision at INFO level.
+
+ORB uses first 15 bars (first 15 minutes from open).
+If fewer than 15 bars exist (early scan at 09:30–09:44),
+ORB uses all available bars — still valid as a partial range.
+
+All indicators operate on the full session from 09:30 ET so
+VWAP anchors correctly from open regardless of scan time.
 """
 
 import logging
@@ -46,10 +52,15 @@ def compute_macd(
 
 
 def compute_orb(df: pd.DataFrame, minutes: int = 15) -> dict:
-    orb_df = df.iloc[:minutes]
+    """
+    Opening Range Breakout using the first N minutes.
+    If fewer than N bars exist (early scan), uses all available bars.
+    """
+    orb_bars = df.iloc[:minutes] if len(df) >= minutes else df
     return {
-        "high": float(orb_df["high"].max()),
-        "low":  float(orb_df["low"].min()),
+        "high": float(orb_bars["high"].max()),
+        "low":  float(orb_bars["low"].min()),
+        "bars": len(orb_bars),
     }
 
 
@@ -69,52 +80,51 @@ def get_direction_bias(
 ) -> Optional[str]:
     """
     Requires 2 of 3 conditions to agree.
-    Logs each condition result so you can see why direction is None.
+    Logs each condition so you can see exactly why direction is None.
     """
     signals = []
 
     # 1. VWAP
     if price > vwap * 1.001:
         signals.append("bullish")
-        vwap_result = f"bullish (price {price:.2f} > VWAP {vwap:.2f})"
+        vwap_str = f"bullish (price {price:.2f} > VWAP {vwap:.2f})"
     elif price < vwap * 0.999:
         signals.append("bearish")
-        vwap_result = f"bearish (price {price:.2f} < VWAP {vwap:.2f})"
+        vwap_str = f"bearish (price {price:.2f} < VWAP {vwap:.2f})"
     else:
-        vwap_result = f"neutral (price {price:.2f} at VWAP {vwap:.2f})"
+        vwap_str = f"neutral (price {price:.2f} at VWAP {vwap:.2f})"
 
     # 2. EMA cross
     if ema9 > ema21:
         signals.append("bullish")
-        ema_result = f"bullish (EMA9 {ema9:.2f} > EMA21 {ema21:.2f})"
+        ema_str = f"bullish (EMA9 {ema9:.2f} > EMA21 {ema21:.2f})"
     elif ema9 < ema21:
         signals.append("bearish")
-        ema_result = f"bearish (EMA9 {ema9:.2f} < EMA21 {ema21:.2f})"
+        ema_str = f"bearish (EMA9 {ema9:.2f} < EMA21 {ema21:.2f})"
     else:
-        ema_result = f"neutral (EMA9 {ema9:.2f} = EMA21 {ema21:.2f})"
+        ema_str = f"neutral (EMA9=EMA21={ema9:.2f})"
 
     # 3. ORB
     if price > orb["high"]:
         signals.append("bullish")
-        orb_result = f"bullish (price {price:.2f} > ORB high {orb['high']:.2f})"
+        orb_str = f"bullish (price {price:.2f} > ORB high {orb['high']:.2f})"
     elif price < orb["low"]:
         signals.append("bearish")
-        orb_result = f"bearish (price {price:.2f} < ORB low {orb['low']:.2f})"
+        orb_str = f"bearish (price {price:.2f} < ORB low {orb['low']:.2f})"
     else:
-        orb_result = f"neutral (price {price:.2f} inside ORB {orb['low']:.2f}–{orb['high']:.2f})"
+        orb_str = (
+            f"neutral (price {price:.2f} inside ORB "
+            f"{orb['low']:.2f}–{orb['high']:.2f}, "
+            f"{orb['bars']} bars)"
+        )
 
     bull = signals.count("bullish")
     bear = signals.count("bearish")
 
-    if bull >= 2:
-        direction = "bullish"
-    elif bear >= 2:
-        direction = "bearish"
-    else:
-        direction = None
+    direction = "bullish" if bull >= 2 else "bearish" if bear >= 2 else None
 
     logger.info(
-        f"{symbol}: VWAP={vwap_result} | EMA={ema_result} | ORB={orb_result} "
+        f"{symbol}: VWAP={vwap_str} | EMA={ema_str} | ORB={orb_str} "
         f"→ direction={direction} (bull={bull} bear={bear})"
     )
 
@@ -122,12 +132,10 @@ def get_direction_bias(
 
 
 def run_all(df: pd.DataFrame, symbol: str = "?") -> dict:
-    """
-    Run all indicators on a 1-min bar DataFrame.
-    Returns flat dict of latest values.
-    """
     if df.empty or len(df) < 5:
-        logger.warning(f"{symbol}: not enough bars to compute indicators ({len(df)} bars)")
+        logger.warning(
+            f"{symbol}: only {len(df)} bars — need 5+ for indicators"
+        )
         return {}
 
     close  = df["close"]
@@ -139,21 +147,22 @@ def run_all(df: pd.DataFrame, symbol: str = "?") -> dict:
     rsi_s   = compute_rsi(close, 14)
     macd_df = compute_macd(close)
 
-    vwap  = float(vwap_s.iloc[-1])
-    ema9  = float(ema9_s.iloc[-1])
-    ema21 = float(ema21_s.iloc[-1])
-    rsi   = float(rsi_s.iloc[-1])   if not rsi_s.isna().all()          else 50.0
+    vwap      = float(vwap_s.iloc[-1])
+    ema9      = float(ema9_s.iloc[-1])
+    ema21     = float(ema21_s.iloc[-1])
+    rsi       = float(rsi_s.iloc[-1]) if not rsi_s.isna().all() else 50.0
     macd_hist = float(macd_df["histogram"].iloc[-1]) \
                 if not macd_df["histogram"].isna().all() else 0.0
 
-    orb       = compute_orb(df, minutes=15)
+    orb = compute_orb(df, minutes=15)
+
     direction = get_direction_bias(symbol, latest, vwap, ema9, ema21, orb)
 
     logger.info(
         f"{symbol}: price={latest:.2f} VWAP={vwap:.2f} "
         f"EMA9={ema9:.2f} EMA21={ema21:.2f} "
         f"RSI={rsi:.1f} MACD_hist={macd_hist:.4f} "
-        f"ORB={orb['low']:.2f}–{orb['high']:.2f}"
+        f"ORB={orb['low']:.2f}–{orb['high']:.2f} ({orb['bars']} bars)"
     )
 
     return {
