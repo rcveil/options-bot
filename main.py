@@ -1,8 +1,9 @@
 """
 main.py
 Scheduler and main scan loop.
-Pure async scheduler — no schedule library.
-Heartbeat logs every 5 minutes so you can confirm the loop is alive.
+Scans every 10 minutes during market hours: 09:30–16:00 ET weekdays.
+Uses pure async time checking — no schedule library.
+Heartbeat every 5 minutes confirms loop is alive.
 /scan command triggers scan immediately from Telegram.
 """
 
@@ -37,10 +38,36 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 ET     = ZoneInfo(TIMEZONE)
 
-SCAN_HOUR   = 9
-SCAN_MINUTE = 30
+# Market hours ET
+MARKET_OPEN_HOUR   = 9
+MARKET_OPEN_MINUTE = 30
+MARKET_CLOSE_HOUR  = 16
+MARKET_CLOSE_MINUTE = 0
 
-_last_scan_date: str = ""
+# Scan interval in minutes
+SCAN_INTERVAL_MINUTES = 10
+
+# Tracks the last scan time — "YYYY-MM-DD HH:MM" in ET
+# Prevents double-firing within the same 10-minute window
+_last_scan_slot: str = ""
+
+
+def _is_market_open(now: datetime) -> bool:
+    """True if now is within 09:30–16:00 ET on a weekday."""
+    if now.weekday() >= 5:
+        return False
+    market_open  = now.replace(hour=MARKET_OPEN_HOUR,  minute=MARKET_OPEN_MINUTE,  second=0, microsecond=0)
+    market_close = now.replace(hour=MARKET_CLOSE_HOUR, minute=MARKET_CLOSE_MINUTE, second=0, microsecond=0)
+    return market_open <= now < market_close
+
+
+def _current_scan_slot(now: datetime) -> str:
+    """
+    Returns a string representing the current 10-minute slot.
+    e.g. "2026-04-22 09:30" for any time between 09:30 and 09:39.
+    """
+    slot_minute = (now.minute // SCAN_INTERVAL_MINUTES) * SCAN_INTERVAL_MINUTES
+    return now.strftime(f"%Y-%m-%d %H:") + f"{slot_minute:02d}"
 
 
 async def _scan_iron_condor(
@@ -78,7 +105,7 @@ async def _scan_iron_condor(
     sizing    = compute_position_size(ACCOUNT_SIZE, ic["max_loss"] * 100, regime)
     exits     = credit_exits(ic["total_credit"])
     rationale = (
-        f"No directional bias. IVR {ivr:.0f} elevated — selling premium both sides. "
+        f"No directional bias. IVR {ivr:.0f} — selling premium both sides. "
         f"Price {'above' if price > vwap else 'below'} VWAP. RSI {ind['rsi']:.0f}."
     )
 
@@ -235,9 +262,9 @@ async def scan_ticker(symbol: str, vix: float, regime: str) -> None:
             logger.info(f"{symbol}: SKIP — only {len(df)} bars")
             return
 
-        avg_vol   = await fetch_avg_volume(symbol)
-        rvol      = compute_rvol(df, avg_vol)
-        ind       = run_all(df, symbol=symbol)
+        avg_vol  = await fetch_avg_volume(symbol)
+        rvol     = compute_rvol(df, avg_vol)
+        ind      = run_all(df, symbol=symbol)
         if not ind:
             logger.info(f"{symbol}: SKIP — indicators empty")
             return
@@ -259,25 +286,35 @@ async def scan_ticker(symbol: str, vix: float, regime: str) -> None:
             return
 
         if decision.strategy == "iron_condor":
-            await _scan_iron_condor(symbol, vix, regime, ivr, price, vwap, rvol, ind, now_et)
+            await _scan_iron_condor(
+                symbol, vix, regime, ivr, price, vwap, rvol, ind, now_et
+            )
         else:
-            await _scan_vertical(symbol, decision, vix, regime, ivr, price, vwap, rvol, ind, now_et)
+            await _scan_vertical(
+                symbol, decision, vix, regime, ivr,
+                price, vwap, rvol, ind, now_et
+            )
 
     except Exception as e:
         logger.error(f"{symbol}: ERROR — {e}", exc_info=True)
 
 
 async def run_scan() -> None:
-    """Run full scan. Called by scheduler and /scan command."""
-    global _last_scan_date
+    """
+    Run full scan across all symbols.
+    Called by scheduler every 10 minutes during market hours,
+    and by /scan command for manual triggers.
+    """
+    global _last_scan_slot
 
-    now   = datetime.now(ET)
-    today = now.strftime("%Y-%m-%d")
+    now  = datetime.now(ET)
+    slot = _current_scan_slot(now)
 
-    if _last_scan_date == today:
-        logger.info("Scan already ran today — skipping")
+    # Prevent double-firing within the same 10-minute window
+    if _last_scan_slot == slot:
+        logger.info(f"Scan already ran for slot {slot} — skipping")
         return
-    _last_scan_date = today
+    _last_scan_slot = slot
 
     logger.info("=" * 60)
     logger.info(f"SCAN STARTED {now.strftime('%A %Y-%m-%d %H:%M %Z')}")
@@ -293,6 +330,8 @@ async def run_scan() -> None:
 
     if regime == "pause":
         await send_warning(format_vix_warning(vix, regime))
+        logger.info("VIX pause — standing down")
+        logger.info("=" * 60)
         return
 
     warning = format_vix_warning(vix, regime)
@@ -310,30 +349,41 @@ async def run_scan() -> None:
 
 async def scheduler_loop() -> None:
     """
-    Checks every 30 seconds if it is 09:30 ET on a weekday.
-    Logs a heartbeat every 5 minutes so you can confirm it is running.
+    Checks every 30 seconds:
+    - Is it a weekday between 09:30 and 16:00 ET?
+    - Has 10 minutes elapsed since the last scan?
+    If both true, fires run_scan().
+    Heartbeat log every 5 minutes.
     """
-    logger.info(f"Scheduler started. Will fire at {SCAN_HOUR:02d}:{SCAN_MINUTE:02d} ET weekdays.")
+    logger.info(
+        f"Scheduler started — scanning every {SCAN_INTERVAL_MINUTES} min "
+        f"during market hours (09:30–16:00 ET weekdays)"
+    )
     heartbeat_counter = 0
 
     while True:
-        now          = datetime.now(ET)
-        is_weekday   = now.weekday() < 5
-        is_scan_time = now.hour == SCAN_HOUR and now.minute == SCAN_MINUTE
+        now = datetime.now(ET)
 
-        # Heartbeat every 10 ticks (10 × 30s = 5 minutes)
         heartbeat_counter += 1
-        if heartbeat_counter >= 10:
+        if heartbeat_counter >= 10:   # every 10 × 30s = 5 minutes
             logger.info(
                 f"Scheduler heartbeat — "
                 f"{now.strftime('%A %H:%M %Z')} "
-                f"weekday={is_weekday}"
+                f"market_open={_is_market_open(now)}"
             )
             heartbeat_counter = 0
 
-        if is_weekday and is_scan_time:
-            logger.info(f"SCAN TRIGGER: {now.strftime('%A %H:%M %Z')}")
-            await run_scan()
+        if _is_market_open(now):
+            # Fire at the start of each 10-minute slot
+            slot_second = (now.minute % SCAN_INTERVAL_MINUTES) * 60 + now.second
+            if slot_second < 30:    # within the first 30s of a new slot
+                slot = _current_scan_slot(now)
+                if slot != _last_scan_slot:
+                    logger.info(
+                        f"SCAN TRIGGER: {now.strftime('%A %H:%M %Z')} "
+                        f"(slot={slot})"
+                    )
+                    await run_scan()
 
         await asyncio.sleep(30)
 
@@ -342,8 +392,12 @@ async def main() -> None:
     await init_db()
 
     now = datetime.now(ET)
-    logger.info(f"Bot starting — server time: {now.strftime('%A %Y-%m-%d %H:%M %Z')}")
-    logger.info(f"Scan scheduled: {SCAN_HOUR:02d}:{SCAN_MINUTE:02d} ET weekdays")
+    logger.info(f"Bot starting — {now.strftime('%A %Y-%m-%d %H:%M %Z')}")
+    logger.info(
+        f"Scan schedule: every {SCAN_INTERVAL_MINUTES} min "
+        f"from 09:30 to 16:00 ET weekdays "
+        f"(up to {(390 // SCAN_INTERVAL_MINUTES)} scans per day)"
+    )
 
     tg_app = build_application()
     async with tg_app:
