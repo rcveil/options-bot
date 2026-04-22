@@ -1,10 +1,14 @@
 """
 data/candles.py
-Fetches 1-minute OHLCV bars using yfinance (Yahoo Finance).
+Fetches 1-minute OHLCV bars using yfinance.
 
-yfinance is reliable, free, and returns clean pandas DataFrames.
-DXLinkStreamer candle subscriptions are unreliable for historical bars
-so we use yfinance instead.
+Key design:
+- fetch_intraday_bars: always fetches ALL bars from 09:30 ET to now for today.
+  This is correct — VWAP and ORB need the full session, not just recent bars.
+  yfinance start/end params used explicitly for reliability.
+
+- fetch_avg_volume: cached per trading day so it is only fetched once
+  regardless of how many scans run. Avg volume does not change intraday.
 """
 
 import logging
@@ -17,60 +21,67 @@ import yfinance as yf
 logger = logging.getLogger(__name__)
 ET     = ZoneInfo("America/New_York")
 
-
-def _today_session_start() -> datetime:
-    today = date.today()
-    return datetime(today.year, today.month, today.day, 9, 30, tzinfo=ET)
+# Cache: {symbol: (date_str, avg_volume)}
+# Resets automatically when date changes
+_avg_volume_cache: dict[str, tuple[str, float]] = {}
 
 
 async def fetch_intraday_bars(
-    symbol:    str,
-    from_time: datetime | None = None,
-    interval:  str = "1m",
+    symbol:   str,
+    interval: str = "1m",
 ) -> pd.DataFrame:
     """
-    Fetch 1-minute OHLCV bars for today's session using yfinance.
-    Returns DataFrame with columns: open, high, low, close, volume
-    Indexed by datetime (ET, timezone-aware).
-    Returns empty DataFrame on failure.
-    """
-    if from_time is None:
-        from_time = _today_session_start()
+    Fetch all 1-minute bars from 09:30 ET to now for today's session.
+    Always fetches from open so VWAP and ORB are computed on full session data.
 
-    logger.info(
-        f"{symbol}: fetching {interval} bars via yfinance "
-        f"from {from_time.strftime('%H:%M')} ET"
-    )
+    Uses explicit start/end with prepost=False so we never get pre/after-market
+    bars that would corrupt VWAP and ORB calculations.
+
+    Returns DataFrame indexed by tz-aware datetime (ET).
+    Returns empty DataFrame on failure or if market is closed.
+    """
+    today = date.today()
+    start = today.strftime("%Y-%m-%d")
+    # end is tomorrow to ensure we get all of today's bars
+    end   = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    logger.info(f"{symbol}: fetching {interval} bars for {start}")
 
     try:
         ticker = yf.Ticker(symbol)
-        # period="1d" gives today's intraday bars at 1m resolution
-        df = ticker.history(period="1d", interval=interval)
+        df = ticker.history(
+            start    = start,
+            end      = end,
+            interval = interval,
+            prepost  = False,   # regular session only — no pre/after market
+        )
 
-        if df.empty:
+        if df is None or df.empty:
             logger.warning(
                 f"{symbol}: yfinance returned empty — "
-                f"market may be closed"
+                f"market may be closed or symbol invalid"
             )
             return pd.DataFrame()
 
-        # Normalise column names to lowercase
+        # Normalise column names
         df.columns = [c.lower() for c in df.columns]
         df = df[["open", "high", "low", "close", "volume"]]
 
-        # Ensure timezone-aware index in ET
+        # Ensure ET timezone
         if df.index.tz is None:
             df.index = df.index.tz_localize("UTC").tz_convert(ET)
         else:
             df.index = df.index.tz_convert(ET)
 
-        # Filter to bars from our window onwards
-        df = df[df.index >= from_time]
+        # Filter to regular session only (09:30–16:00 ET)
+        session_start = datetime(today.year, today.month, today.day,
+                                  9, 30, tzinfo=ET)
+        session_end   = datetime(today.year, today.month, today.day,
+                                 16,  0, tzinfo=ET)
+        df = df[(df.index >= session_start) & (df.index < session_end)]
 
         if df.empty:
-            logger.warning(
-                f"{symbol}: no bars after {from_time.strftime('%H:%M')} ET"
-            )
+            logger.warning(f"{symbol}: no bars within regular session hours")
             return pd.DataFrame()
 
         logger.info(
@@ -90,27 +101,44 @@ async def fetch_avg_volume(
     lookback: int = 20,
 ) -> float:
     """
-    Fetch average daily volume over the past N trading days using yfinance.
-    Returns 0.0 if unavailable.
+    Fetch average daily volume over the past N trading days.
+    Cached per trading day — only fetches once per session regardless
+    of how many scans run during the day.
+    Returns 0.0 if unavailable (graceful — RVOL will default to 1.0).
     """
+    today_str = date.today().strftime("%Y-%m-%d")
+
+    # Return cached value if already fetched today
+    if symbol in _avg_volume_cache:
+        cached_date, cached_vol = _avg_volume_cache[symbol]
+        if cached_date == today_str:
+            return cached_vol
+
     try:
         ticker  = yf.Ticker(symbol)
+        # Fetch enough days to get lookback trading days
         hist    = ticker.history(period=f"{lookback * 2}d", interval="1d")
 
-        if hist.empty:
+        if hist is None or hist.empty:
             logger.warning(f"{symbol}: no daily history from yfinance")
+            _avg_volume_cache[symbol] = (today_str, 0.0)
             return 0.0
 
         hist.columns = [c.lower() for c in hist.columns]
         volumes = hist["volume"].dropna().tolist()
 
         if not volumes:
+            _avg_volume_cache[symbol] = (today_str, 0.0)
             return 0.0
 
         avg = sum(volumes[-lookback:]) / len(volumes[-lookback:])
-        logger.info(f"{symbol}: avg daily volume = {avg:,.0f}")
-        return float(avg)
+        avg = float(avg)
+
+        _avg_volume_cache[symbol] = (today_str, avg)
+        logger.info(f"{symbol}: avg daily volume = {avg:,.0f} (cached for today)")
+        return avg
 
     except Exception as e:
         logger.warning(f"{symbol}: avg volume fetch failed — {e}")
+        _avg_volume_cache[symbol] = (today_str, 0.0)
         return 0.0
