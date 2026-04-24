@@ -1,114 +1,170 @@
 """
 data/candles.py
-Fetches 1-minute OHLCV bars using yfinance.
+Fetches 1-minute OHLCV bars using Tastytrade DXLinkStreamer.
 
-Fixes:
-- Semaphore reduced to 1 (sequential fetches) — yfinance rate limits
-  aggressively on cloud IPs; sequential is the only reliable approach
-- asyncio.to_thread() prevents blocking the event loop
-- TzCache directed to /tmp to avoid Fly.io filesystem conflict
-- Avg volume cached per trading day
-- Retry with longer backoff on 429
+Replaces yfinance entirely — yfinance is rate-limited on cloud IPs.
+Tastytrade's own streamer is the correct data source since we are
+already authenticated.
+
+Key SDK facts (verified from source):
+- subscribe_candle(symbols, interval, start_time) takes plain symbols
+  e.g. ["SPY"], not pre-formatted strings
+- interval format: "1m", "5m", "1h" etc.
+- start_time: datetime object for the start of the data range
+- extended_trading_hours=False (default) = regular session only
+- Candle fields: time (ms), open, high, low, close, volume, index
+
+Avg volume cached per trading day — fetched once per session.
 """
 
 import asyncio
 import logging
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
+from collections import defaultdict
 
 import pandas as pd
-import yfinance as yf
 
-# Direct TzCache to /tmp to avoid Fly.io '/root/.cache' conflict
-try:
-    yf.set_tz_cache_location("/tmp/yfinance_tz_cache")
-except Exception:
-    pass
+from data.tastytrade import get_session
 
 logger = logging.getLogger(__name__)
 ET     = ZoneInfo("America/New_York")
 
-# Sequential fetches only — yfinance rate limits hard on cloud IPs
-_semaphore = asyncio.Semaphore(1)
+CANDLE_TIMEOUT   = 20.0    # seconds to wait for snapshot
+MAX_BARS         = 100     # max 1m bars to collect (~100 min)
 
 # Avg volume cache: {symbol: (date_str, avg_volume)}
 _avg_volume_cache: dict = {}
 
-MAX_RETRIES = 4
-RETRY_DELAY = 8.0   # seconds * attempt number
 
-
-def _fetch_bars_sync(symbol, start, end, interval):
-    ticker = yf.Ticker(symbol)
-    return ticker.history(start=start, end=end, interval=interval, prepost=False)
-
-
-def _fetch_volume_sync(symbol, period):
-    ticker = yf.Ticker(symbol)
-    return ticker.history(period=period, interval="1d")
-
-
-async def fetch_intraday_bars(symbol: str, interval: str = "1m"):
+def _session_start_today() -> datetime:
     today = date.today()
-    start = today.strftime("%Y-%m-%d")
-    end   = (today + timedelta(days=1)).strftime("%Y-%m-%d")
-    logger.info(f"{symbol}: fetching {interval} bars")
+    return datetime(today.year, today.month, today.day, 9, 30, tzinfo=ET)
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            async with _semaphore:
-                df = await asyncio.to_thread(
-                    _fetch_bars_sync, symbol, start, end, interval
+
+async def _stream_candles(
+    symbol:     str,
+    interval:   str,
+    start_time: datetime,
+    max_bars:   int = MAX_BARS,
+) -> list[dict]:
+    """
+    Subscribe to candle stream and collect bars.
+    Returns list of bar dicts.
+    """
+    from tastytrade import DXLinkStreamer
+    from tastytrade.dxfeed import Candle
+
+    session = await get_session()
+    rows    = []
+
+    try:
+        async with asyncio.timeout(CANDLE_TIMEOUT):
+            async with DXLinkStreamer(session) as streamer:
+                await streamer.subscribe_candle(
+                    symbols                = [symbol],
+                    interval               = interval,
+                    start_time             = start_time,
+                    extended_trading_hours = False,   # regular session only
                 )
 
-            if df is None or df.empty:
-                logger.warning(f"{symbol}: yfinance returned empty — market may be closed")
-                return pd.DataFrame()
-
-            df.columns = [c.lower() for c in df.columns]
-            df = df[["open", "high", "low", "close", "volume"]]
-
-            if df.index.tz is None:
-                df.index = df.index.tz_localize("UTC").tz_convert(ET)
-            else:
-                df.index = df.index.tz_convert(ET)
-
-            s_start = datetime(today.year, today.month, today.day,  9, 30, tzinfo=ET)
-            s_end   = datetime(today.year, today.month, today.day, 16,  0, tzinfo=ET)
-            df = df[(df.index >= s_start) & (df.index < s_end)]
-
-            if df.empty:
-                logger.warning(f"{symbol}: no bars in regular session")
-                return pd.DataFrame()
-
-            logger.info(
-                f"{symbol}: {len(df)} bars — "
-                f"{df.index[0].strftime('%H:%M')} to "
-                f"{df.index[-1].strftime('%H:%M')} ET"
-            )
-            return df
-
-        except Exception as e:
-            msg = str(e)
-            if any(x in msg for x in ("Too Many Requests", "Rate limited", "429")):
-                if attempt < MAX_RETRIES:
-                    wait = RETRY_DELAY * attempt
-                    logger.warning(
-                        f"{symbol}: rate limited — waiting {wait:.0f}s "
-                        f"(attempt {attempt}/{MAX_RETRIES})"
+                async for candle in streamer.listen(Candle):
+                    bar_time = datetime.fromtimestamp(
+                        candle.time / 1000, tz=ET
                     )
-                    await asyncio.sleep(wait)
-                else:
-                    logger.error(f"{symbol}: rate limited after {MAX_RETRIES} attempts — skipping")
-                    return pd.DataFrame()
-            else:
-                logger.error(f"{symbol}: yfinance error — {e}")
-                return pd.DataFrame()
 
-    return pd.DataFrame()
+                    # Skip bars before session start
+                    if bar_time < start_time:
+                        continue
+
+                    # Skip bars with zero open (malformed)
+                    if not candle.open or float(candle.open) == 0:
+                        continue
+
+                    rows.append({
+                        "datetime": bar_time,
+                        "open":     float(candle.open),
+                        "high":     float(candle.high),
+                        "low":      float(candle.low),
+                        "close":    float(candle.close),
+                        "volume":   float(candle.volume or 0),
+                    })
+
+                    if len(rows) >= max_bars:
+                        break
+
+    except asyncio.TimeoutError:
+        logger.warning(
+            f"{symbol}: candle stream timed out after {CANDLE_TIMEOUT}s "
+            f"— returning {len(rows)} bars collected"
+        )
+    except BaseException as e:
+        if type(e).__name__ in ("ExceptionGroup", "BaseExceptionGroup"):
+            logger.warning(
+                f"{symbol}: candle stream ended (TaskGroup) "
+                f"— {len(rows)} bars collected"
+            )
+        else:
+            logger.warning(
+                f"{symbol}: candle stream error — "
+                f"{type(e).__name__}: {e} "
+                f"— {len(rows)} bars collected"
+            )
+
+    return rows
 
 
-async def fetch_avg_volume(symbol: str, lookback: int = 20) -> float:
+async def fetch_intraday_bars(
+    symbol:   str,
+    interval: str = "1m",
+) -> pd.DataFrame:
+    """
+    Fetch 1-min OHLCV bars from 09:30 ET to now using Tastytrade streamer.
+    Returns DataFrame indexed by tz-aware datetime (ET).
+    Returns empty DataFrame on failure.
+    """
+    start_time = _session_start_today()
+    logger.info(
+        f"{symbol}: fetching {interval} bars "
+        f"from {start_time.strftime('%H:%M')} ET"
+    )
+
+    rows = await _stream_candles(symbol, interval, start_time)
+
+    if not rows:
+        logger.warning(
+            f"{symbol}: no bars returned — "
+            f"market may be closed or outside session hours"
+        )
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows).set_index("datetime").sort_index()
+
+    # Clip to regular session 09:30–16:00 ET
+    today      = date.today()
+    s_end      = datetime(today.year, today.month, today.day, 16, 0, tzinfo=ET)
+    df         = df[df.index < s_end]
+
+    if df.empty:
+        logger.warning(f"{symbol}: no bars within regular session")
+        return pd.DataFrame()
+
+    logger.info(
+        f"{symbol}: {len(df)} bars — "
+        f"{df.index[0].strftime('%H:%M')} to "
+        f"{df.index[-1].strftime('%H:%M')} ET"
+    )
+    return df
+
+
+async def fetch_avg_volume(
+    symbol:   str,
+    lookback: int = 20,
+) -> float:
+    """
+    Average daily volume over past N trading days via Tastytrade streamer.
+    Cached per trading day — only fetched once per session.
+    """
     today_str = date.today().strftime("%Y-%m-%d")
 
     if symbol in _avg_volume_cache:
@@ -116,28 +172,21 @@ async def fetch_avg_volume(symbol: str, lookback: int = 20) -> float:
         if cached_date == today_str:
             return cached_vol
 
-    try:
-        async with _semaphore:
-            hist = await asyncio.to_thread(
-                _fetch_volume_sync, symbol, f"{lookback * 2}d"
-            )
+    # Fetch daily bars going back lookback*2 calendar days
+    from_date  = datetime.now(ET) - timedelta(days=lookback * 2)
+    rows       = await _stream_candles(symbol, "1d", from_date, max_bars=lookback * 2)
 
-        if hist is None or hist.empty:
-            _avg_volume_cache[symbol] = (today_str, 0.0)
-            return 0.0
-
-        hist.columns = [c.lower() for c in hist.columns]
-        volumes = hist["volume"].dropna().tolist()
-        if not volumes:
-            _avg_volume_cache[symbol] = (today_str, 0.0)
-            return 0.0
-
-        avg = float(sum(volumes[-lookback:]) / len(volumes[-lookback:]))
-        _avg_volume_cache[symbol] = (today_str, avg)
-        logger.info(f"{symbol}: avg volume = {avg:,.0f} (cached)")
-        return avg
-
-    except Exception as e:
-        logger.warning(f"{symbol}: avg volume fetch failed — {e}")
+    if not rows:
+        logger.warning(f"{symbol}: no daily volume data")
         _avg_volume_cache[symbol] = (today_str, 0.0)
         return 0.0
+
+    volumes = [r["volume"] for r in rows if r["volume"] > 0]
+    if not volumes:
+        _avg_volume_cache[symbol] = (today_str, 0.0)
+        return 0.0
+
+    avg = float(sum(volumes[-lookback:]) / len(volumes[-lookback:]))
+    _avg_volume_cache[symbol] = (today_str, avg)
+    logger.info(f"{symbol}: avg daily volume = {avg:,.0f} (cached)")
+    return avg
