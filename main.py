@@ -341,7 +341,8 @@ async def run_scan() -> None:
     symbols = INDEX_ONLY if regime == "spike" else ALL_SYMBOLS
     logger.info(f"Scanning {len(symbols)} symbols")
 
-    await asyncio.gather(*[scan_ticker(s, vix, regime) for s in symbols])
+    for s in symbols:
+        await scan_ticker(s, vix, regime)
 
     logger.info("SCAN COMPLETE")
     logger.info("=" * 60)
