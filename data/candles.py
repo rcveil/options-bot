@@ -2,11 +2,13 @@
 data/candles.py
 Fetches 1-minute OHLCV bars using yfinance.
 
-Rate limiting fix:
-- Semaphore limits concurrent yfinance requests to 3 at a time
-- asyncio.to_thread() so sync yfinance calls do not block the event loop
-- Retry with backoff on 429 Too Many Requests
-- Avg volume cached per trading day (fetched once, not every scan)
+Fixes:
+- Semaphore reduced to 1 (sequential fetches) — yfinance rate limits
+  aggressively on cloud IPs; sequential is the only reliable approach
+- asyncio.to_thread() prevents blocking the event loop
+- TzCache directed to /tmp to avoid Fly.io filesystem conflict
+- Avg volume cached per trading day
+- Retry with longer backoff on 429
 """
 
 import asyncio
@@ -17,14 +19,23 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import yfinance as yf
 
+# Direct TzCache to /tmp to avoid Fly.io '/root/.cache' conflict
+try:
+    yf.set_tz_cache_location("/tmp/yfinance_tz_cache")
+except Exception:
+    pass
+
 logger = logging.getLogger(__name__)
 ET     = ZoneInfo("America/New_York")
 
-_semaphore = asyncio.Semaphore(3)
+# Sequential fetches only — yfinance rate limits hard on cloud IPs
+_semaphore = asyncio.Semaphore(1)
+
+# Avg volume cache: {symbol: (date_str, avg_volume)}
 _avg_volume_cache: dict = {}
 
-MAX_RETRIES = 3
-RETRY_DELAY = 5.0
+MAX_RETRIES = 4
+RETRY_DELAY = 8.0   # seconds * attempt number
 
 
 def _fetch_bars_sync(symbol, start, end, interval):
@@ -41,12 +52,14 @@ async def fetch_intraday_bars(symbol: str, interval: str = "1m"):
     today = date.today()
     start = today.strftime("%Y-%m-%d")
     end   = (today + timedelta(days=1)).strftime("%Y-%m-%d")
-    logger.info(f"{symbol}: fetching {interval} bars for {start}")
+    logger.info(f"{symbol}: fetching {interval} bars")
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             async with _semaphore:
-                df = await asyncio.to_thread(_fetch_bars_sync, symbol, start, end, interval)
+                df = await asyncio.to_thread(
+                    _fetch_bars_sync, symbol, start, end, interval
+                )
 
             if df is None or df.empty:
                 logger.warning(f"{symbol}: yfinance returned empty — market may be closed")
@@ -65,7 +78,7 @@ async def fetch_intraday_bars(symbol: str, interval: str = "1m"):
             df = df[(df.index >= s_start) & (df.index < s_end)]
 
             if df.empty:
-                logger.warning(f"{symbol}: no bars within regular session")
+                logger.warning(f"{symbol}: no bars in regular session")
                 return pd.DataFrame()
 
             logger.info(
@@ -80,13 +93,16 @@ async def fetch_intraday_bars(symbol: str, interval: str = "1m"):
             if any(x in msg for x in ("Too Many Requests", "Rate limited", "429")):
                 if attempt < MAX_RETRIES:
                     wait = RETRY_DELAY * attempt
-                    logger.warning(f"{symbol}: rate limited — retrying in {wait:.0f}s (attempt {attempt}/{MAX_RETRIES})")
+                    logger.warning(
+                        f"{symbol}: rate limited — waiting {wait:.0f}s "
+                        f"(attempt {attempt}/{MAX_RETRIES})"
+                    )
                     await asyncio.sleep(wait)
                 else:
-                    logger.error(f"{symbol}: rate limited after {MAX_RETRIES} attempts")
+                    logger.error(f"{symbol}: rate limited after {MAX_RETRIES} attempts — skipping")
                     return pd.DataFrame()
             else:
-                logger.error(f"{symbol}: yfinance fetch failed — {e}")
+                logger.error(f"{symbol}: yfinance error — {e}")
                 return pd.DataFrame()
 
     return pd.DataFrame()
@@ -102,7 +118,9 @@ async def fetch_avg_volume(symbol: str, lookback: int = 20) -> float:
 
     try:
         async with _semaphore:
-            hist = await asyncio.to_thread(_fetch_volume_sync, symbol, f"{lookback * 2}d")
+            hist = await asyncio.to_thread(
+                _fetch_volume_sync, symbol, f"{lookback * 2}d"
+            )
 
         if hist is None or hist.empty:
             _avg_volume_cache[symbol] = (today_str, 0.0)
@@ -110,14 +128,13 @@ async def fetch_avg_volume(symbol: str, lookback: int = 20) -> float:
 
         hist.columns = [c.lower() for c in hist.columns]
         volumes = hist["volume"].dropna().tolist()
-
         if not volumes:
             _avg_volume_cache[symbol] = (today_str, 0.0)
             return 0.0
 
         avg = float(sum(volumes[-lookback:]) / len(volumes[-lookback:]))
         _avg_volume_cache[symbol] = (today_str, avg)
-        logger.info(f"{symbol}: avg daily volume = {avg:,.0f} (cached)")
+        logger.info(f"{symbol}: avg volume = {avg:,.0f} (cached)")
         return avg
 
     except Exception as e:
