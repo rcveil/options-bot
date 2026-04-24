@@ -2,15 +2,14 @@
 data/candles.py
 Fetches 1-minute OHLCV bars using yfinance.
 
-Key design:
-- fetch_intraday_bars: always fetches ALL bars from 09:30 ET to now for today.
-  This is correct — VWAP and ORB need the full session, not just recent bars.
-  yfinance start/end params used explicitly for reliability.
-
-- fetch_avg_volume: cached per trading day so it is only fetched once
-  regardless of how many scans run. Avg volume does not change intraday.
+Rate limiting fix:
+- Semaphore limits concurrent yfinance requests to 3 at a time
+- asyncio.to_thread() so sync yfinance calls do not block the event loop
+- Retry with backoff on 429 Too Many Requests
+- Avg volume cached per trading day (fetched once, not every scan)
 """
 
+import asyncio
 import logging
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
@@ -21,106 +20,91 @@ import yfinance as yf
 logger = logging.getLogger(__name__)
 ET     = ZoneInfo("America/New_York")
 
-# Cache: {symbol: (date_str, avg_volume)}
-# Resets automatically when date changes
-_avg_volume_cache: dict[str, tuple[str, float]] = {}
+_semaphore = asyncio.Semaphore(3)
+_avg_volume_cache: dict = {}
+
+MAX_RETRIES = 3
+RETRY_DELAY = 5.0
 
 
-async def fetch_intraday_bars(
-    symbol:   str,
-    interval: str = "1m",
-) -> pd.DataFrame:
-    """
-    Fetch all 1-minute bars from 09:30 ET to now for today's session.
-    Always fetches from open so VWAP and ORB are computed on full session data.
+def _fetch_bars_sync(symbol, start, end, interval):
+    ticker = yf.Ticker(symbol)
+    return ticker.history(start=start, end=end, interval=interval, prepost=False)
 
-    Uses explicit start/end with prepost=False so we never get pre/after-market
-    bars that would corrupt VWAP and ORB calculations.
 
-    Returns DataFrame indexed by tz-aware datetime (ET).
-    Returns empty DataFrame on failure or if market is closed.
-    """
+def _fetch_volume_sync(symbol, period):
+    ticker = yf.Ticker(symbol)
+    return ticker.history(period=period, interval="1d")
+
+
+async def fetch_intraday_bars(symbol: str, interval: str = "1m"):
     today = date.today()
     start = today.strftime("%Y-%m-%d")
-    # end is tomorrow to ensure we get all of today's bars
     end   = (today + timedelta(days=1)).strftime("%Y-%m-%d")
-
     logger.info(f"{symbol}: fetching {interval} bars for {start}")
 
-    try:
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(
-            start    = start,
-            end      = end,
-            interval = interval,
-            prepost  = False,   # regular session only — no pre/after market
-        )
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            async with _semaphore:
+                df = await asyncio.to_thread(_fetch_bars_sync, symbol, start, end, interval)
 
-        if df is None or df.empty:
-            logger.warning(
-                f"{symbol}: yfinance returned empty — "
-                f"market may be closed or symbol invalid"
+            if df is None or df.empty:
+                logger.warning(f"{symbol}: yfinance returned empty — market may be closed")
+                return pd.DataFrame()
+
+            df.columns = [c.lower() for c in df.columns]
+            df = df[["open", "high", "low", "close", "volume"]]
+
+            if df.index.tz is None:
+                df.index = df.index.tz_localize("UTC").tz_convert(ET)
+            else:
+                df.index = df.index.tz_convert(ET)
+
+            s_start = datetime(today.year, today.month, today.day,  9, 30, tzinfo=ET)
+            s_end   = datetime(today.year, today.month, today.day, 16,  0, tzinfo=ET)
+            df = df[(df.index >= s_start) & (df.index < s_end)]
+
+            if df.empty:
+                logger.warning(f"{symbol}: no bars within regular session")
+                return pd.DataFrame()
+
+            logger.info(
+                f"{symbol}: {len(df)} bars — "
+                f"{df.index[0].strftime('%H:%M')} to "
+                f"{df.index[-1].strftime('%H:%M')} ET"
             )
-            return pd.DataFrame()
+            return df
 
-        # Normalise column names
-        df.columns = [c.lower() for c in df.columns]
-        df = df[["open", "high", "low", "close", "volume"]]
+        except Exception as e:
+            msg = str(e)
+            if any(x in msg for x in ("Too Many Requests", "Rate limited", "429")):
+                if attempt < MAX_RETRIES:
+                    wait = RETRY_DELAY * attempt
+                    logger.warning(f"{symbol}: rate limited — retrying in {wait:.0f}s (attempt {attempt}/{MAX_RETRIES})")
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(f"{symbol}: rate limited after {MAX_RETRIES} attempts")
+                    return pd.DataFrame()
+            else:
+                logger.error(f"{symbol}: yfinance fetch failed — {e}")
+                return pd.DataFrame()
 
-        # Ensure ET timezone
-        if df.index.tz is None:
-            df.index = df.index.tz_localize("UTC").tz_convert(ET)
-        else:
-            df.index = df.index.tz_convert(ET)
-
-        # Filter to regular session only (09:30–16:00 ET)
-        session_start = datetime(today.year, today.month, today.day,
-                                  9, 30, tzinfo=ET)
-        session_end   = datetime(today.year, today.month, today.day,
-                                 16,  0, tzinfo=ET)
-        df = df[(df.index >= session_start) & (df.index < session_end)]
-
-        if df.empty:
-            logger.warning(f"{symbol}: no bars within regular session hours")
-            return pd.DataFrame()
-
-        logger.info(
-            f"{symbol}: {len(df)} bars — "
-            f"{df.index[0].strftime('%H:%M')} to "
-            f"{df.index[-1].strftime('%H:%M')} ET"
-        )
-        return df
-
-    except Exception as e:
-        logger.error(f"{symbol}: yfinance fetch failed — {e}")
-        return pd.DataFrame()
+    return pd.DataFrame()
 
 
-async def fetch_avg_volume(
-    symbol:   str,
-    lookback: int = 20,
-) -> float:
-    """
-    Fetch average daily volume over the past N trading days.
-    Cached per trading day — only fetches once per session regardless
-    of how many scans run during the day.
-    Returns 0.0 if unavailable (graceful — RVOL will default to 1.0).
-    """
+async def fetch_avg_volume(symbol: str, lookback: int = 20) -> float:
     today_str = date.today().strftime("%Y-%m-%d")
 
-    # Return cached value if already fetched today
     if symbol in _avg_volume_cache:
         cached_date, cached_vol = _avg_volume_cache[symbol]
         if cached_date == today_str:
             return cached_vol
 
     try:
-        ticker  = yf.Ticker(symbol)
-        # Fetch enough days to get lookback trading days
-        hist    = ticker.history(period=f"{lookback * 2}d", interval="1d")
+        async with _semaphore:
+            hist = await asyncio.to_thread(_fetch_volume_sync, symbol, f"{lookback * 2}d")
 
         if hist is None or hist.empty:
-            logger.warning(f"{symbol}: no daily history from yfinance")
             _avg_volume_cache[symbol] = (today_str, 0.0)
             return 0.0
 
@@ -131,11 +115,9 @@ async def fetch_avg_volume(
             _avg_volume_cache[symbol] = (today_str, 0.0)
             return 0.0
 
-        avg = sum(volumes[-lookback:]) / len(volumes[-lookback:])
-        avg = float(avg)
-
+        avg = float(sum(volumes[-lookback:]) / len(volumes[-lookback:]))
         _avg_volume_cache[symbol] = (today_str, avg)
-        logger.info(f"{symbol}: avg daily volume = {avg:,.0f} (cached for today)")
+        logger.info(f"{symbol}: avg daily volume = {avg:,.0f} (cached)")
         return avg
 
     except Exception as e:
