@@ -2,26 +2,20 @@
 data/candles.py
 Fetches 1-minute OHLCV bars using Tastytrade DXLinkStreamer.
 
-Replaces yfinance entirely — yfinance is rate-limited on cloud IPs.
-Tastytrade's own streamer is the correct data source since we are
-already authenticated.
+Key change from v3: use get_event() in a loop instead of listen().
+listen() is an infinite generator that blocks on a queue — if the queue
+never populates (candle subscription fails silently), listen() hangs forever.
 
-Key SDK facts (verified from source):
-- subscribe_candle(symbols, interval, start_time) takes plain symbols
-  e.g. ["SPY"], not pre-formatted strings
-- interval format: "1m", "5m", "1h" etc.
-- start_time: datetime object for the start of the data range
-- extended_trading_hours=False (default) = regular session only
-- Candle fields: time (ms), open, high, low, close, volume, index
+get_event() with a short timeout per event allows us to collect whatever
+arrives and exit gracefully after a reasonable wait.
 
-Avg volume cached per trading day — fetched once per session.
+Avg volume cached per trading day.
 """
 
 import asyncio
 import logging
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
-from collections import defaultdict
 
 import pandas as pd
 
@@ -30,8 +24,9 @@ from data.tastytrade import get_session
 logger = logging.getLogger(__name__)
 ET     = ZoneInfo("America/New_York")
 
-CANDLE_TIMEOUT   = 20.0    # seconds to wait for snapshot
-MAX_BARS         = 100     # max 1m bars to collect (~100 min)
+EVENT_TIMEOUT = 2.0    # seconds to wait per individual event
+MAX_EVENTS    = 100    # max bars to collect
+TOTAL_TIMEOUT = 15.0   # total time budget for the entire fetch
 
 # Avg volume cache: {symbol: (date_str, avg_volume)}
 _avg_volume_cache: dict = {}
@@ -46,10 +41,10 @@ async def _stream_candles(
     symbol:     str,
     interval:   str,
     start_time: datetime,
-    max_bars:   int = MAX_BARS,
+    max_events: int = MAX_EVENTS,
 ) -> list[dict]:
     """
-    Subscribe to candle stream and collect bars.
+    Subscribe to candle stream and collect bars using get_event() loop.
     Returns list of bar dicts.
     """
     from tastytrade import DXLinkStreamer
@@ -59,55 +54,64 @@ async def _stream_candles(
     rows    = []
 
     try:
-        async with asyncio.timeout(CANDLE_TIMEOUT):
+        async with asyncio.timeout(TOTAL_TIMEOUT):
             async with DXLinkStreamer(session) as streamer:
                 await streamer.subscribe_candle(
                     symbols                = [symbol],
                     interval               = interval,
                     start_time             = start_time,
-                    extended_trading_hours = False,   # regular session only
+                    extended_trading_hours = False,
                 )
 
-                async for candle in streamer.listen(Candle):
-                    bar_time = datetime.fromtimestamp(
-                        candle.time / 1000, tz=ET
-                    )
+                # Collect events one at a time with individual timeout
+                for _ in range(max_events):
+                    try:
+                        candle = await asyncio.wait_for(
+                            streamer.get_event(Candle),
+                            timeout=EVENT_TIMEOUT,
+                        )
 
-                    # Skip bars before session start
-                    if bar_time < start_time:
-                        continue
+                        bar_time = datetime.fromtimestamp(
+                            candle.time / 1000, tz=ET
+                        )
 
-                    # Skip bars with zero open (malformed)
-                    if not candle.open or float(candle.open) == 0:
-                        continue
+                        if bar_time < start_time:
+                            continue
 
-                    rows.append({
-                        "datetime": bar_time,
-                        "open":     float(candle.open),
-                        "high":     float(candle.high),
-                        "low":      float(candle.low),
-                        "close":    float(candle.close),
-                        "volume":   float(candle.volume or 0),
-                    })
+                        if not candle.open or float(candle.open) == 0:
+                            continue
 
-                    if len(rows) >= max_bars:
+                        rows.append({
+                            "datetime": bar_time,
+                            "open":     float(candle.open),
+                            "high":     float(candle.high),
+                            "low":      float(candle.low),
+                            "close":    float(candle.close),
+                            "volume":   float(candle.volume or 0),
+                        })
+
+                    except asyncio.TimeoutError:
+                        # No more events arriving — exit cleanly
+                        logger.debug(
+                            f"{symbol}: no event within {EVENT_TIMEOUT}s "
+                            f"— ending stream with {len(rows)} bars"
+                        )
                         break
 
     except asyncio.TimeoutError:
         logger.warning(
-            f"{symbol}: candle stream timed out after {CANDLE_TIMEOUT}s "
-            f"— returning {len(rows)} bars collected"
+            f"{symbol}: total timeout {TOTAL_TIMEOUT}s "
+            f"— returning {len(rows)} bars"
         )
     except BaseException as e:
         if type(e).__name__ in ("ExceptionGroup", "BaseExceptionGroup"):
             logger.warning(
-                f"{symbol}: candle stream ended (TaskGroup) "
+                f"{symbol}: TaskGroup exception "
                 f"— {len(rows)} bars collected"
             )
         else:
             logger.warning(
-                f"{symbol}: candle stream error — "
-                f"{type(e).__name__}: {e} "
+                f"{symbol}: stream error {type(e).__name__}: {e} "
                 f"— {len(rows)} bars collected"
             )
 
@@ -121,7 +125,6 @@ async def fetch_intraday_bars(
     """
     Fetch 1-min OHLCV bars from 09:30 ET to now using Tastytrade streamer.
     Returns DataFrame indexed by tz-aware datetime (ET).
-    Returns empty DataFrame on failure.
     """
     start_time = _session_start_today()
     logger.info(
@@ -134,16 +137,16 @@ async def fetch_intraday_bars(
     if not rows:
         logger.warning(
             f"{symbol}: no bars returned — "
-            f"market may be closed or outside session hours"
+            f"market may be closed or symbol unavailable"
         )
         return pd.DataFrame()
 
     df = pd.DataFrame(rows).set_index("datetime").sort_index()
 
     # Clip to regular session 09:30–16:00 ET
-    today      = date.today()
-    s_end      = datetime(today.year, today.month, today.day, 16, 0, tzinfo=ET)
-    df         = df[df.index < s_end]
+    today = date.today()
+    s_end = datetime(today.year, today.month, today.day, 16, 0, tzinfo=ET)
+    df    = df[df.index < s_end]
 
     if df.empty:
         logger.warning(f"{symbol}: no bars within regular session")
@@ -162,7 +165,7 @@ async def fetch_avg_volume(
     lookback: int = 20,
 ) -> float:
     """
-    Average daily volume over past N trading days via Tastytrade streamer.
+    Average daily volume over past N trading days.
     Cached per trading day — only fetched once per session.
     """
     today_str = date.today().strftime("%Y-%m-%d")
@@ -172,9 +175,11 @@ async def fetch_avg_volume(
         if cached_date == today_str:
             return cached_vol
 
-    # Fetch daily bars going back lookback*2 calendar days
-    from_date  = datetime.now(ET) - timedelta(days=lookback * 2)
-    rows       = await _stream_candles(symbol, "1d", from_date, max_bars=lookback * 2)
+    # Fetch daily bars
+    from_date = datetime.now(ET) - timedelta(days=lookback * 2)
+    rows      = await _stream_candles(
+        symbol, "1d", from_date, max_events=lookback * 2
+    )
 
     if not rows:
         logger.warning(f"{symbol}: no daily volume data")
