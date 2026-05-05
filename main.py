@@ -24,9 +24,9 @@ from data.market import get_vix, classify_vix, get_ivr
 from data.candles import fetch_intraday_bars, fetch_avg_volume
 from signals.indicators import run_all, compute_rvol
 from signals.strategy import select_strategy, compute_pop, compute_position_size
-from signals.chain import build_spread, build_iron_condor, build_butterfly
-from signals.filters import check_credit_spread, check_debit_spread, check_iron_condor, check_butterfly
-from signals.sizing import credit_exits, debit_exits, butterfly_exits
+from signals.chain import build_spread, build_iron_condor, build_jade_lizard
+from signals.filters import check_credit_spread, check_debit_spread, check_iron_condor, check_jade_lizard
+from signals.sizing import credit_exits, debit_exits, jade_lizard_exits
 from alerts.formatter import SignalPayload, format_signal, format_vix_warning
 from alerts.telegram import send_signal, send_warning, build_application
 from storage.journal import init_db, log_signal
@@ -255,90 +255,124 @@ async def _scan_vertical(
     logger.info(f"{symbol}: SIGNAL SENT ✓ {sell_strike}/{buy_strike} credit=${net_credit:.2f}")
 
 
-async def _scan_butterfly(
+async def _scan_jade_lizard(
     symbol: str, vix: float, regime: str, ivr: float,
     price: float, vwap: float, rvol: float, ind: dict, now_et: str,
 ) -> None:
-    dte_min, dte_max = 25, 35
-    bf = await build_butterfly(
+    jl = await build_jade_lizard(
         symbol=symbol, underlying_price=price,
-        dte_min=dte_min, dte_max=dte_max,
+        dte_min=DTE_CREDIT_MIN, dte_max=DTE_CREDIT_MAX,
     )
-    if bf is None:
-        logger.info(f"{symbol} BF: no valid butterfly")
+    if jl is None:
+        logger.info(f"{symbol} JL: no valid jade lizard")
         return
 
-    body_g = bf["body_greeks"]
-    result = check_butterfly(
-        debit        = bf["net_debit"],
-        wing_width   = bf["wing_width"],
-        max_profit   = bf["max_profit"],
-        net_delta    = bf["net_delta"],
-        body_bid_ask = body_g["ask"] - body_g["bid"],
-        body_mid     = body_g["mid"],
-        dte          = bf["dte"],
-        open_interest= body_g.get("oi", 999),
-        symbol       = symbol,
-        vix_regime   = regime,
+    put_g        = jl["put_greeks"]
+    short_call_g = jl["short_call_greeks"]
+    pop_put      = compute_pop(price, jl["put_strike"],        jl["dte"], put_g["iv"],        "P")
+    pop_call     = compute_pop(price, jl["short_call_strike"], jl["dte"], short_call_g["iv"], "C")
+
+    result = check_jade_lizard(
+        put_credit         = jl["put_credit"],
+        put_delta          = put_g["delta"],
+        put_bid_ask        = put_g["ask"] - put_g["bid"],
+        put_mid            = put_g["mid"],
+        put_oi             = put_g.get("oi", 999),
+        call_spread_credit = jl["call_spread_credit"],
+        call_spread_width  = jl["call_spread_width"],
+        short_call_delta   = short_call_g["delta"],
+        call_bid_ask       = short_call_g["ask"] - short_call_g["bid"],
+        call_mid           = short_call_g["mid"],
+        call_oi            = short_call_g.get("oi", 999),
+        total_credit       = jl["total_credit"],
+        upside_risk_free   = jl["upside_risk_free"],
+        pop_put            = pop_put,
+        pop_call           = pop_call,
+        dte                = jl["dte"],
+        symbol             = symbol,
+        vix_regime         = regime,
     )
 
     if not result.passed:
-        logger.info(f"{symbol} BF: REJECTED — {'; '.join(result.reasons)}")
+        logger.info(f"{symbol} JL: REJECTED — {'; '.join(result.reasons)}")
         return
 
-    sizing = compute_position_size(ACCOUNT_SIZE, bf["max_loss"] * 100, regime)
-    exits  = butterfly_exits(bf["net_debit"], bf["max_profit"])
-    profit_multiple = round(bf["max_profit"] / bf["net_debit"], 1) if bf["net_debit"] > 0 else 0
+    sizing    = compute_position_size(ACCOUNT_SIZE, jl["sizing_max_loss"], regime)
+    exits     = jade_lizard_exits(jl["total_credit"])
+    upside_tag = "Zero upside risk" if jl["upside_risk_free"] else "Upside risk NOT eliminated"
     rationale = (
-        f"No directional bias. IVR {ivr:.0f} in 30–50 range — "
-        f"butterfly lottery ticket. High IV reduces net debit. "
-        f"Price at ${price:.2f}, body strike ${bf['body_strike']:.0f}. "
-        f"RSI {ind['rsi']:.0f}. Max profit {profit_multiple}x debit if stock pins body at expiry."
+        f"Bullish bias. IVR {ivr:.0f} — volatility skew favours short put. "
+        f"Short put ${jl['put_strike']:.0f} + short call spread "
+        f"${jl['short_call_strike']:.0f}/${jl['long_call_strike']:.0f}. "
+        f"{upside_tag}. Breakeven ${jl['breakeven']:.2f}. "
+        f"Price {'above' if price > vwap else 'below'} VWAP. RSI {ind['rsi']:.0f}."
     )
 
     payload = SignalPayload(
-        symbol=symbol, direction="neutral",
-        strategy="long_butterfly", structure="debit",
+        symbol=symbol, direction="bullish",
+        strategy="jade_lizard", structure="credit",
         vix=vix, vix_regime=regime, timestamp_et=now_et,
-        expiry=bf["expiry"], dte=bf["dte"],
-        credit_debit=bf["net_debit"], max_loss=bf["max_loss"],
-        ivr=ivr, pop=0.0,   # PoP is not standard for butterfly — depends on pinning
+        sell_strike=jl["put_strike"], buy_strike=jl["short_call_strike"],
+        expiry=jl["expiry"], dte=jl["dte"],
+        credit_debit=jl["total_credit"], max_loss=jl["sizing_max_loss"],
+        ivr=ivr,
+        credit_width_ratio=jl["call_spread_ratio"],
+        bid_ask_spread=put_g["ask"] - put_g["bid"],
+        mid_price=put_g["mid"],
+        delta=put_g["delta"], gamma=put_g.get("gamma", 0.0),
+        theta=put_g.get("theta", 0.0), vega=put_g.get("vega", 0.0),
+        iv=put_g["iv"], open_interest=put_g.get("oi", 0),
+        pop=pop_put,
         contracts=sizing["contracts"],
         risk_dollars=sizing["risk_dollars"], risk_pct=sizing["risk_pct"],
-        stop_level=exits["stop_value"], profit_target=exits["profit_target"],
+        stop_level=exits["stop_debit"], profit_target=exits["profit_target"],
         stop_note=exits["stop_note"], target_note=exits["target_note"],
         rationale=rationale, rvol=rvol, warnings=result.warnings,
-        # Butterfly-specific fields
-        lower_strike=bf["lower_strike"],
-        body_strike=bf["body_strike"],
-        upper_strike=bf["upper_strike"],
-        wing_width=bf["wing_width"],
-        debit_ratio=bf["debit_ratio"],
-        max_profit=bf["max_profit"],
-        net_delta=bf["net_delta"],
-        # Greeks from body (short legs)
-        delta=body_g["delta"], gamma=body_g.get("gamma", 0.0),
-        theta=body_g.get("theta", 0.0), vega=body_g.get("vega", 0.0),
-        iv=body_g["iv"], open_interest=body_g.get("oi", 0),
-        bid_ask_spread=body_g["ask"] - body_g["bid"],
-        mid_price=body_g["mid"],
+        # Jade lizard-specific fields
+        jl_put_strike         = jl["put_strike"],
+        jl_put_credit         = jl["put_credit"],
+        jl_short_call_strike  = jl["short_call_strike"],
+        jl_long_call_strike   = jl["long_call_strike"],
+        jl_call_spread_width  = jl["call_spread_width"],
+        jl_call_spread_credit = jl["call_spread_credit"],
+        jl_call_spread_ratio  = jl["call_spread_ratio"],
+        jl_upside_risk_free   = jl["upside_risk_free"],
+        jl_breakeven          = jl["breakeven"],
+        jl_pop_put            = pop_put,
+        jl_pop_call           = pop_call,
     )
 
     await send_signal(format_signal(payload))
     await log_signal({
-        "symbol": symbol, "strategy": "long_butterfly",
-        "direction": "neutral", "structure": "debit",
-        "sell_strike": bf["body_strike"], "buy_strike": bf["lower_strike"],
-        "spread_width": bf["wing_width"], "option_type": "C",
-        "expiry": bf["expiry"], "dte": bf["dte"],
-        "credit_debit": bf["net_debit"], "max_loss": bf["max_loss"],
-        "ivr": ivr, "vix": vix, "vix_regime": regime, "pop": 0.0,
-        "delta": body_g["delta"], "theta": body_g.get("theta", 0.0),
-        "vega": body_g.get("vega", 0.0), "iv": body_g["iv"],
+        "symbol": symbol, "strategy": "jade_lizard",
+        "direction": "bullish", "structure": "credit",
+        "sell_strike": jl["put_strike"], "buy_strike": jl["short_call_strike"],
+        "spread_width": jl["call_spread_width"], "option_type": None,
+        "expiry": jl["expiry"], "dte": jl["dte"],
+        "credit_debit": jl["total_credit"], "max_loss": jl["sizing_max_loss"],
+        "ivr": ivr, "vix": vix, "vix_regime": regime, "pop": pop_put,
+        "delta": put_g["delta"], "theta": put_g.get("theta", 0.0),
+        "vega": put_g.get("vega", 0.0), "iv": put_g["iv"],
         "contracts": sizing["contracts"], "risk_dollars": sizing["risk_dollars"],
         "vwap": vwap, "rvol": rvol, "rationale": rationale, "timestamp_et": now_et,
+        # Jade lizard journal fields
+        "jl_put_strike":         jl["put_strike"],
+        "jl_put_credit":         jl["put_credit"],
+        "jl_short_call_strike":  jl["short_call_strike"],
+        "jl_long_call_strike":   jl["long_call_strike"],
+        "jl_call_spread_width":  jl["call_spread_width"],
+        "jl_call_spread_credit": jl["call_spread_credit"],
+        "jl_call_spread_ratio":  jl["call_spread_ratio"],
+        "jl_upside_risk_free":   jl["upside_risk_free"],
+        "jl_breakeven":          jl["breakeven"],
     })
-    logger.info(f"{symbol} BF: SIGNAL SENT ✓ {bf['lower_strike']}/{bf['body_strike']}/{bf['upper_strike']} debit=${bf['net_debit']:.2f}")
+    logger.info(
+        f"{symbol} JL: SIGNAL SENT ✓ "
+        f"put=${jl['put_strike']:.0f} "
+        f"call_spread=${jl['short_call_strike']:.0f}/{jl['long_call_strike']:.0f} "
+        f"total_credit=${jl['total_credit']:.2f} "
+        f"upside_risk_free={jl['upside_risk_free']}"
+    )
 
 
 async def scan_ticker(symbol: str, vix: float, regime: str) -> None:
@@ -375,8 +409,8 @@ async def scan_ticker(symbol: str, vix: float, regime: str) -> None:
             await _scan_iron_condor(
                 symbol, vix, regime, ivr, price, vwap, rvol, ind, now_et
             )
-        elif decision.strategy == "long_butterfly":
-            await _scan_butterfly(
+        elif decision.strategy == "jade_lizard":
+            await _scan_jade_lizard(
                 symbol, vix, regime, ivr, price, vwap, rvol, ind, now_et
             )
         else:
