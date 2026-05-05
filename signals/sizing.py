@@ -36,3 +36,20 @@ def debit_exits(debit_paid: float) -> dict:
         "stop_note":     f"Close if spread falls to ${stop_at:.2f} value",
         "target_note":   f"Take profit if spread reaches ${target_at:.2f} value",
     }
+
+
+def butterfly_exits(debit_paid: float, max_profit: float) -> dict:
+    """
+    Butterfly exit levels.
+      Stop:   close at -50% of debit paid (lose half the lottery ticket cost).
+      Target: close at 25% of max profit — butterflies rarely pin perfectly,
+              take partial profit early.
+    """
+    stop_at   = round(debit_paid * 0.50, 2)
+    target_at = round(max_profit * 0.25, 2)
+    return {
+        "stop_value":    stop_at,
+        "profit_target": target_at,
+        "stop_note":     f"Close if value drops to ${stop_at:.2f} (−50% of debit)",
+        "target_note":   f"Take profit at ${target_at:.2f} (25% of max profit)",
+    }
