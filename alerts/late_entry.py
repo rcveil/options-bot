@@ -71,38 +71,27 @@ async def _reprice_iron_condor(signal: dict) -> tuple[float, float, float, float
     return total_credit, put_ratio, call_ratio, wing_width, worst_ratio
 
 
-async def _reprice_jade_lizard(signal: dict) -> tuple[float, float, float, float, float, bool]:
+async def _reprice_butterfly(signal: dict) -> tuple[float, float, float, float]:
     """
-    Re-fetch all 3 legs of a jade lizard.
-    Returns (total_credit, put_credit, call_spread_credit,
-             call_spread_ratio, put_pop_approx, upside_risk_free).
+    Re-fetch all 3 strikes of a butterfly.
+    Returns (net_debit, wing_width, debit_ratio, max_profit).
     """
-    symbol             = signal["symbol"]
-    expiry             = signal["expiry"]
-    put_strike         = signal["jl_put_strike"]
-    short_call_strike  = signal["jl_short_call_strike"]
-    long_call_strike   = signal["jl_long_call_strike"]
-    call_spread_width  = signal.get("jl_call_spread_width",
-                                    abs(long_call_strike - short_call_strike))
+    symbol       = signal["symbol"]
+    expiry       = signal["expiry"]
+    lower_strike = signal["lower_strike"]
+    body_strike  = signal["body_strike"]
+    upper_strike = signal["upper_strike"]
+    wing_width   = signal.get("wing_width", abs(body_strike - lower_strike))
 
-    put_g        = await get_greeks(symbol, expiry, put_strike,        "P")
-    short_call_g = await get_greeks(symbol, expiry, short_call_strike, "C")
-    long_call_g  = await get_greeks(symbol, expiry, long_call_strike,  "C")
+    lower_g = await get_greeks(symbol, expiry, lower_strike, "C")
+    body_g  = await get_greeks(symbol, expiry, body_strike,  "C")
+    upper_g = await get_greeks(symbol, expiry, upper_strike, "C")
 
-    put_credit         = put_g["mid"]
-    call_spread_credit = round(short_call_g["mid"] - long_call_g["mid"], 2)
-    total_credit       = round(put_credit + call_spread_credit, 2)
-    call_spread_ratio  = call_spread_credit / call_spread_width \
-                         if call_spread_width > 0 else 0
-    upside_risk_free   = total_credit > call_spread_width
+    net_debit  = round(lower_g["mid"] + upper_g["mid"] - (2 * body_g["mid"]), 2)
+    max_profit = round(wing_width - net_debit, 2)
+    debit_ratio = net_debit / wing_width if wing_width > 0 else 1.0
 
-    return (
-        total_credit,
-        round(put_credit, 2),
-        call_spread_credit,
-        round(call_spread_ratio, 4),
-        upside_risk_free,
-    )
+    return net_debit, wing_width, debit_ratio, max_profit
 
 
 async def evaluate_late_entry(symbol: str) -> str:
@@ -128,62 +117,61 @@ async def evaluate_late_entry(symbol: str) -> str:
     else:
         price_vs_vwap = "at VWAP"
 
-    is_ic = signal["strategy"] == "iron_condor"
-    is_jl = signal["strategy"] == "jade_lizard"
+    is_ic  = signal["strategy"] == "iron_condor"
+    is_bf  = signal["strategy"] == "long_butterfly"
 
-    # ── Jade lizard re-evaluation ──────────────────────────────────────
-    if is_jl:
+    # ── Butterfly re-evaluation ────────────────────────────────────────
+    if is_bf:
         try:
-            total_credit, put_credit, call_spread_credit, \
-                call_spread_ratio, upside_risk_free = \
-                await _reprice_jade_lizard(signal)
+            net_debit, wing_width, debit_ratio, max_profit = \
+                await _reprice_butterfly(signal)
         except Exception as e:
-            return f"Could not re-price jade lizard for {symbol}: {e}"
+            return f"Could not re-price butterfly for {symbol}: {e}"
 
-        call_spread_width = signal.get("jl_call_spread_width", 5.0)
-        original_credit   = signal["credit_debit"]
+        original_debit = signal["credit_debit"]
+        profit_multiple = round(max_profit / net_debit, 1) if net_debit > 0 else 0
+        price_moved = abs(quote["mid"] - signal.get("body_strike", quote["mid"]))
+        wing_width_val = signal.get("wing_width", 5.0)
 
-        # Worst-case ratio: use call spread ratio as the binding constraint
-        if upside_risk_free and call_spread_ratio >= MIN_CREDIT_WIDTH_RATIO:
+        # Valid if debit hasn't grown more than 50% and stock is still near body
+        if debit_ratio <= 0.25 and price_moved < wing_width_val * 0.5:
             verdict = "valid"
             advice  = (
-                f"Jade lizard still intact. Total credit ${total_credit:.2f}. "
-                f"Put credit ${put_credit:.2f}, call spread ${call_spread_credit:.2f} "
-                f"({call_spread_ratio:.0%}). Zero upside risk preserved. "
-                f"Enter at market. Stop if total debit to close reaches "
-                f"${total_credit * 2:.2f}."
+                f"Butterfly still intact. Current debit ${net_debit:.2f} "
+                f"({debit_ratio:.0%} of width). "
+                f"Stock ${quote['mid']:.2f} is ${price_moved:.2f} from body strike "
+                f"${signal.get('body_strike', '?')}. "
+                f"Max profit ${max_profit:.2f} ({profit_multiple}x debit). "
+                f"Enter at market. Stop at 50% of debit."
             )
-        elif total_credit > 0 and call_spread_ratio >= MIN_CREDIT_WIDTH_RATIO * 0.85:
+        elif debit_ratio <= 0.35 and price_moved < wing_width_val * 0.75:
             verdict = "marginal"
             advice  = (
-                f"Setup slightly weakened. Total credit ${total_credit:.2f} "
-                f"({'zero upside risk' if upside_risk_free else 'upside risk NOT eliminated'}). "
-                f"Call spread ratio {call_spread_ratio:.0%}. "
-                f"1 contract only. Stop at ${total_credit * 2:.2f}."
+                f"Debit crept up to ${net_debit:.2f} ({debit_ratio:.0%} of width). "
+                f"Stock has moved ${price_moved:.2f} from body. "
+                f"1 contract only — reduced reward/risk. "
+                f"Stop at 50% of debit."
             )
         else:
             verdict = "expired"
             advice  = (
-                f"Jade lizard has deteriorated. Total credit ${total_credit:.2f}, "
-                f"call spread ratio {call_spread_ratio:.0%}, "
-                f"upside risk free: {upside_risk_free}. Do not enter."
+                f"Butterfly has deteriorated. Debit ${net_debit:.2f} "
+                f"({debit_ratio:.0%} of width) or stock too far from body "
+                f"(${price_moved:.2f} away). Do not enter."
             )
 
         return format_late_entry(
             symbol          = symbol,
             strategy        = signal["strategy"],
             original_time   = signal["timestamp_et"],
-            original_credit = original_credit,
-            current_credit  = total_credit,
-            current_ratio   = call_spread_ratio,
+            original_credit = original_debit,
+            current_credit  = net_debit,
+            current_ratio   = debit_ratio,
             current_pop     = 0.0,
             current_ivr     = ivr,
             price_vs_vwap   = price_vs_vwap,
             verdict         = verdict,
             advice          = advice,
-            jl_put_credit   = put_credit,
-            jl_call_credit  = call_spread_credit,
-            jl_upside_free  = upside_risk_free,
         )
 
     # ── Iron condor re-evaluation ──────────────────────────────────────

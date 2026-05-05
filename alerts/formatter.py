@@ -1,299 +1,220 @@
 """
 alerts/formatter.py
-Builds Telegram message strings from signal payloads.
-Supports vertical spreads and iron condors.
+Format signals for Telegram.
+Handles vertical spreads, iron condors, and butterflies.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 
 @dataclass
 class SignalPayload:
-    # Identity
-    symbol:        str
-    direction:     str
-    strategy:      str
-    structure:     str
-    vix:           float
-    vix_regime:    str
-    timestamp_et:  str
-
-    # Vertical spread fields (used for all non-IC strategies)
-    sell_strike:   float
-    buy_strike:    float
-    expiry:        str
-    dte:           int
-    credit_debit:  float
-    max_loss:      float
-
-    # Iron condor fields (None for vertical spreads)
-    put_sell_strike:   Optional[float] = None
-    put_buy_strike:    Optional[float] = None
-    put_credit:        Optional[float] = None
-    put_credit_ratio:  Optional[float] = None
-    call_sell_strike:  Optional[float] = None
-    call_buy_strike:   Optional[float] = None
-    call_credit:       Optional[float] = None
+    # Common
+    symbol:           str
+    direction:        str
+    strategy:         str
+    structure:        str
+    vix:              float
+    vix_regime:       str
+    timestamp_et:     str
+    expiry:           str
+    dte:              int
+    ivr:              float
+    credit_debit:     float
+    max_loss:         float
+    pop:              float
+    contracts:        int
+    risk_dollars:     float
+    risk_pct:         float
+    stop_level:       float
+    profit_target:    float
+    stop_note:        str
+    target_note:      str
+    rationale:        str
+    rvol:             float
+    warnings:         list[str]
+    
+    # Vertical spreads
+    sell_strike:      Optional[float] = None
+    buy_strike:       Optional[float] = None
+    credit_width_ratio: Optional[float] = None
+    bid_ask_spread:   Optional[float] = None
+    mid_price:        Optional[float] = None
+    delta:            Optional[float] = None
+    gamma:            Optional[float] = None
+    theta:            Optional[float] = None
+    vega:             Optional[float] = None
+    iv:               Optional[float] = None
+    open_interest:    Optional[int] = None
+    
+    # Iron condor
+    put_sell_strike:  Optional[float] = None
+    put_buy_strike:   Optional[float] = None
+    put_credit:       Optional[float] = None
+    put_credit_ratio: Optional[float] = None
+    call_sell_strike: Optional[float] = None
+    call_buy_strike:  Optional[float] = None
+    call_credit:      Optional[float] = None
     call_credit_ratio: Optional[float] = None
-    wing_width:        Optional[float] = None
-
-    # Jade lizard fields (None for other strategies)
-    jl_put_strike:         Optional[float] = None
-    jl_put_credit:         Optional[float] = None
-    jl_short_call_strike:  Optional[float] = None
-    jl_long_call_strike:   Optional[float] = None
-    jl_call_spread_width:  Optional[float] = None
-    jl_call_spread_credit: Optional[float] = None
-    jl_call_spread_ratio:  Optional[float] = None
-    jl_upside_risk_free:   Optional[bool]  = None
-    jl_breakeven:          Optional[float] = None
-    jl_pop_put:            Optional[float] = None
-    jl_pop_call:           Optional[float] = None
-
-    # Threshold values
-    ivr:                float = 50.0
-    credit_width_ratio: float = 0.0
-    bid_ask_spread:     float = 0.0
-    mid_price:          float = 0.0
-
-    # Greeks (short leg / put leg for IC)
-    delta:         float = 0.0
-    gamma:         float = 0.0
-    theta:         float = 0.0
-    vega:          float = 0.0
-    iv:            float = 0.0
-    open_interest: int   = 0
-
-    # PoP and sizing
-    pop:           float = 0.0
-    contracts:     int   = 1
-    risk_dollars:  float = 0.0
-    risk_pct:      float = 0.0
-
-    # Exits
-    stop_level:    float = 0.0
-    profit_target: float = 0.0
-    stop_note:     str   = ""
-    target_note:   str   = ""
-
-    # Rationale
-    rationale:     str         = ""
-    rvol:          float       = 1.0
-    warnings:      list[str]   = field(default_factory=list)
+    wing_width:       Optional[float] = None
+    
+    # Butterfly
+    lower_strike:     Optional[float] = None
+    body_strike:      Optional[float] = None
+    upper_strike:     Optional[float] = None
+    debit_ratio:      Optional[float] = None
+    max_profit:       Optional[float] = None
+    net_delta:        Optional[float] = None
 
 
-STRATEGY_LABELS = {
-    "bull_put_spread":  "Bull put spread",
-    "bear_call_spread": "Bear call spread",
-    "bull_call_spread": "Bull call spread",
-    "bear_put_spread":  "Bear put spread",
-    "iron_condor":      "Iron condor",
-    "jade_lizard":      "Jade lizard",
-    "long_butterfly":   "Long butterfly",
-}
-
-REGIME_ICON = {
-    "normal":   "🟢",
-    "elevated": "🟡",
-    "spike":    "🔴",
-    "pause":    "⛔",
-}
-
-DIRECTION_ICON = {
-    "bullish": "▲",
-    "bearish": "▼",
-    "neutral": "↔",
-}
+def format_signal(payload: SignalPayload) -> str:
+    """Format signal for Telegram with HTML."""
+    
+    if payload.strategy == "iron_condor":
+        return _format_iron_condor(payload)
+    elif payload.strategy == "long_butterfly":
+        return _format_butterfly(payload)
+    else:
+        return _format_vertical(payload)
 
 
-def _pop_bar(pop: float, width: int = 10) -> str:
-    filled = round(pop * width)
-    return "█" * filled + "░" * (width - filled)
-
-
-def _format_vertical(p: SignalPayload, structure_tag: str,
-                     credit_sign: str) -> str:
-    """Format message for single vertical spread."""
-    return (
-        f"<b>Trade structure</b>\n"
-        f"Sell  {p.sell_strike:.0f}  |  Buy  {p.buy_strike:.0f}\n"
-        f"Expiry  {p.expiry}  ·  {p.dte} DTE\n"
-        f"{p.structure.capitalize()}  {credit_sign}${abs(p.credit_debit):.2f}"
-        f"  ·  Max loss  ${p.max_loss:.2f}\n\n"
-        f"<b>Entry gates</b>\n"
-        f"IVR {p.ivr:.0f}  ·  Credit/width {p.credit_width_ratio:.0%}"
-        f"  ·  Bid/ask ${p.bid_ask_spread:.2f}"
-    )
+def _format_vertical(p: SignalPayload) -> str:
+    lines = [
+        f"<b>🎯 {p.symbol} {p.strategy.upper().replace('_', ' ')}</b>",
+        f"",
+        f"<b>Structure:</b> {p.structure.capitalize()} | {p.direction.capitalize()}",
+        f"<b>Strikes:</b> Sell ${p.sell_strike} / Buy ${p.buy_strike}",
+        f"<b>Expiry:</b> {p.expiry} ({p.dte} DTE)",
+        f"<b>Credit/Debit:</b> ${p.credit_debit} ({p.credit_width_ratio:.0%} of width)",
+        f"",
+        f"<b>Risk/Reward:</b>",
+        f"  Max Loss: ${p.max_loss}",
+        f"  PoP: {p.pop:.0%}",
+        f"  Contracts: {p.contracts}",
+        f"  Risk: ${p.risk_dollars} ({p.risk_pct:.1%} account)",
+        f"",
+        f"<b>Greeks:</b>",
+        f"  Delta: {p.delta:.3f} | IV: {p.iv:.1%}",
+        f"  Theta: {p.theta:.2f} | Vega: {p.vega:.2f}",
+        f"",
+        f"<b>Exits:</b>",
+        f"  Stop: {p.stop_note}",
+        f"  Target: {p.target_note}",
+        f"",
+        f"<b>Market:</b>",
+        f"  VIX: {p.vix:.1f} ({p.vix_regime}) | IVR: {p.ivr:.0f}",
+        f"  RVOL: {p.rvol:.1f}x | Time: {p.timestamp_et}",
+        f"",
+        f"<b>Rationale:</b> {p.rationale}",
+    ]
+    
+    if p.warnings:
+        lines.append(f"")
+        lines.append(f"<b>⚠️ Warnings:</b>")
+        for w in p.warnings:
+            lines.append(f"  • {w}")
+    
+    return "\n".join(lines)
 
 
 def _format_iron_condor(p: SignalPayload) -> str:
-    """Format message for iron condor (4 strikes)."""
-    return (
-        f"<b>Trade structure</b>\n"
-        f"Put wing:   Sell {p.put_sell_strike:.0f}  |  Buy {p.put_buy_strike:.0f}"
-        f"  ·  Credit ${p.put_credit:.2f} ({p.put_credit_ratio:.0%})\n"
-        f"Call wing:  Sell {p.call_sell_strike:.0f}  |  Buy {p.call_buy_strike:.0f}"
-        f"  ·  Credit ${p.call_credit:.2f} ({p.call_credit_ratio:.0%})\n"
-        f"Expiry  {p.expiry}  ·  {p.dte} DTE\n"
-        f"Total credit  +${p.credit_debit:.2f}"
-        f"  ·  Wing width  ${p.wing_width:.1f}"
-        f"  ·  Max loss  ${p.max_loss:.2f}\n\n"
-        f"<b>Entry gates (per wing)</b>\n"
-        f"IVR {p.ivr:.0f}"
-        f"  ·  Put ratio {p.put_credit_ratio:.0%}"
-        f"  ·  Call ratio {p.call_credit_ratio:.0%}"
-    )
-
-
-def _format_jade_lizard(p: SignalPayload) -> str:
-    """Format message for jade lizard (3 legs: short put + short call spread)."""
-    upside_tag = "✅ Zero upside risk" if p.jl_upside_risk_free \
-                 else "⚠️ Upside risk NOT eliminated"
-    return (
-        f"<b>Trade structure</b>\n"
-        f"Sell put   {p.jl_put_strike:.0f}"
-        f"  ·  Credit +${p.jl_put_credit:.2f}\n"
-        f"Sell call  {p.jl_short_call_strike:.0f}"
-        f"  ·  Buy call  {p.jl_long_call_strike:.0f}"
-        f"  ·  Width ${p.jl_call_spread_width:.1f}"
-        f"  ·  Credit +${p.jl_call_spread_credit:.2f} ({p.jl_call_spread_ratio:.0%})\n"
-        f"Expiry  {p.expiry}  ·  {p.dte} DTE\n"
-        f"Total credit  +${p.credit_debit:.2f}"
-        f"  ·  Breakeven  ${p.jl_breakeven:.2f}\n"
-        f"{upside_tag}\n\n"
-        f"<b>Entry gates</b>\n"
-        f"IVR {p.ivr:.0f}"
-        f"  ·  Put PoP {p.jl_pop_put:.0%}"
-        f"  ·  Call PoP {p.jl_pop_call:.0%}"
-        f"  ·  Bid/ask ${p.bid_ask_spread:.2f}"
-    )
-
-
-def format_signal(p: SignalPayload) -> str:
-    regime_tag    = f"{REGIME_ICON.get(p.vix_regime, '')} VIX {p.vix:.1f} — {p.vix_regime.upper()}"
-    direction_tag = f"{DIRECTION_ICON.get(p.direction, '')} {p.direction.upper()}"
-    structure_tag = "Sell to open (credit)" if p.structure == "credit" \
-                    else "Buy to open (debit)"
-    credit_sign   = "+" if p.credit_debit >= 0 else ""
-    pop_bar       = _pop_bar(p.pop)
-
-    if p.strategy == "iron_condor":
-        trade_block = _format_iron_condor(p)
-    elif p.strategy == "jade_lizard":
-        trade_block = _format_jade_lizard(p)
-    else:
-        trade_block = _format_vertical(p, structure_tag, credit_sign)
-
-    warning_block = ""
+    lines = [
+        f"<b>🦅 {p.symbol} IRON CONDOR</b>",
+        f"",
+        f"<b>Structure:</b> Credit | Neutral",
+        f"<b>Put Wing:</b> Sell ${p.put_sell_strike} / Buy ${p.put_buy_strike}",
+        f"  Credit: ${p.put_credit} ({p.put_credit_ratio:.0%} of width)",
+        f"<b>Call Wing:</b> Sell ${p.call_sell_strike} / Buy ${p.call_buy_strike}",
+        f"  Credit: ${p.call_credit} ({p.call_credit_ratio:.0%} of width)",
+        f"<b>Expiry:</b> {p.expiry} ({p.dte} DTE)",
+        f"<b>Total Credit:</b> ${p.credit_debit}",
+        f"",
+        f"<b>Risk/Reward:</b>",
+        f"  Max Loss: ${p.max_loss}",
+        f"  PoP: {p.pop:.0%}",
+        f"  Contracts: {p.contracts}",
+        f"  Risk: ${p.risk_dollars} ({p.risk_pct:.1%} account)",
+        f"",
+        f"<b>Exits:</b>",
+        f"  Stop: {p.stop_note}",
+        f"  Target: {p.target_note}",
+        f"",
+        f"<b>Market:</b>",
+        f"  VIX: {p.vix:.1f} ({p.vix_regime}) | IVR: {p.ivr:.0f}",
+        f"  RVOL: {p.rvol:.1f}x | Time: {p.timestamp_et}",
+        f"",
+        f"<b>Rationale:</b> {p.rationale}",
+    ]
+    
     if p.warnings:
-        warning_block = "\n\n" + "\n".join(f"⚠️ {w}" for w in p.warnings)
-
-    return f"""{regime_tag}
-{p.timestamp_et}
-
-<b>{p.symbol}  {direction_tag}</b>
-{STRATEGY_LABELS.get(p.strategy, p.strategy)}  ·  {structure_tag}
-
-{trade_block}
-
-<b>Greeks (short leg)</b>
-Δ {p.delta:+.3f}  Γ {p.gamma:.4f}  Θ {p.theta:+.3f}  V {p.vega:.3f}
-IV {p.iv:.1%}  ·  OI {p.open_interest:,}
-
-<b>Probability of profit</b>
-{pop_bar}  {p.pop:.0%}
-
-<b>Suggested size</b>
-{p.contracts} contract{'s' if p.contracts > 1 else ''}  ·  Risk ${p.risk_dollars:,.0f} ({p.risk_pct:.1%} of account)
-
-<b>Exit plan</b>
-Stop:    {p.stop_note}
-Target:  {p.target_note}
-
-<b>Rationale</b>
-{p.rationale}
-RVOL {p.rvol:.1f}x at signal time.{warning_block}""".strip()
+        lines.append(f"")
+        lines.append(f"<b>⚠️ Warnings:</b>")
+        for w in p.warnings:
+            lines.append(f"  • {w}")
+    
+    return "\n".join(lines)
 
 
-def format_vix_warning(vix: float, regime: str) -> str:
+def _format_butterfly(p: SignalPayload) -> str:
+    """Format butterfly signal — lottery ticket structure."""
+    profit_multiple = p.max_profit / p.credit_debit if p.credit_debit > 0 else 0
+    
+    lines = [
+        f"<b>🦋 {p.symbol} LONG BUTTERFLY</b>",
+        f"",
+        f"<b>Structure:</b> Debit | Neutral (Lottery Ticket)",
+        f"<b>Strikes:</b> Buy ${p.lower_strike} / Sell 2×${p.body_strike} / Buy ${p.upper_strike}",
+        f"<b>Wing Width:</b> ${p.wing_width}",
+        f"<b>Expiry:</b> {p.expiry} ({p.dte} DTE)",
+        f"",
+        f"<b>Cost & Reward:</b>",
+        f"  Net Debit: ${p.credit_debit} ({p.debit_ratio:.0%} of width)",
+        f"  Max Profit: ${p.max_profit} ({profit_multiple:.1f}x debit)",
+        f"  Max Loss: ${p.max_loss} (debit paid)",
+        f"  PoP: {p.pop:.0%} (finish at body strike)",
+        f"",
+        f"<b>Position:</b>",
+        f"  Contracts: {p.contracts}",
+        f"  Risk: ${p.risk_dollars} ({p.risk_pct:.1%} account)",
+        f"  Net Delta: {p.net_delta:.3f} (neutral)",
+        f"",
+        f"<b>Exits:</b>",
+        f"  Stop: {p.stop_note}",
+        f"  Target: {p.target_note}",
+        f"",
+        f"<b>Market:</b>",
+        f"  VIX: {p.vix:.1f} ({p.vix_regime}) | IVR: {p.ivr:.0f}",
+        f"  RVOL: {p.rvol:.1f}x | Time: {p.timestamp_et}",
+        f"",
+        f"<b>Rationale:</b> {p.rationale}",
+    ]
+    
+    if p.warnings:
+        lines.append(f"")
+        lines.append(f"<b>⚠️ Warnings:</b>")
+        for w in p.warnings:
+            lines.append(f"  • {w}")
+    
+    return "\n".join(lines)
+
+
+def format_vix_warning(vix: float, regime: str) -> str | None:
     if regime == "pause":
         return (
-            f"⛔ <b>VIX SPIKE — STANDING DOWN</b>\n\n"
-            f"VIX is at {vix:.1f} (above pause threshold of 45).\n"
-            f"No signals will fire today. Protect capital.\n"
-            f"Bot resumes scanning next session."
+            f"<b>⛔ VIX PAUSE ALERT</b>\n\n"
+            f"VIX at {vix:.1f} — market conditions too volatile.\n"
+            f"Standing down until VIX < 45."
         )
-    if regime == "spike":
+    elif regime == "spike":
         return (
-            f"🔴 <b>VIX SPIKE — INDEX ONLY MODE</b>\n\n"
-            f"VIX is at {vix:.1f}. Single-stock signals suppressed.\n"
-            f"Only SPX / SPY / QQQ alerts active.\n"
-            f"Max 1 contract per trade. Credit spreads only."
+            f"<b>⚠️ VIX SPIKE WARNING</b>\n\n"
+            f"VIX at {vix:.1f} — high volatility regime.\n"
+            f"Only index signals (SPX/SPY/QQQ), 1 contract max."
         )
-    if regime == "elevated":
+    elif regime == "elevated":
         return (
-            f"🟡 <b>VIX ELEVATED — REDUCED SIZE MODE</b>\n\n"
-            f"VIX is at {vix:.1f}. All signals active but size halved.\n"
-            f"Min PoP raised to 70%. Use limit orders at mid."
+            f"<b>📊 VIX ELEVATED</b>\n\n"
+            f"VIX at {vix:.1f} — position sizing reduced 50%."
         )
-    return ""
-
-
-def format_late_entry(
-    symbol:           str,
-    strategy:         str,
-    original_time:    str,
-    original_credit:  float,
-    current_credit:   float,
-    current_ratio:    float,
-    current_pop:      float,
-    current_ivr:      float,
-    price_vs_vwap:    str,
-    verdict:          str,
-    advice:           str,
-    # IC-specific (optional)
-    put_ratio:        Optional[float] = None,
-    call_ratio:       Optional[float] = None,
-    # Jade lizard-specific (optional)
-    jl_put_credit:    Optional[float] = None,
-    jl_call_credit:   Optional[float] = None,
-    jl_upside_free:   Optional[bool]  = None,
-) -> str:
-    verdict_map = {
-        "valid":    "✅ Still valid — enter at current market",
-        "marginal": "⚠️ Marginal — 1 contract only",
-        "expired":  "❌ Setup expired — do not enter",
-    }
-
-    wing_ratios = ""
-    if put_ratio is not None and call_ratio is not None:
-        wing_ratios = (
-            f"Put wing ratio: {put_ratio:.0%}  ·  "
-            f"Call wing ratio: {call_ratio:.0%}\n"
-        )
-
-    jl_block = ""
-    if jl_put_credit is not None and jl_call_credit is not None:
-        upside_tag = "✅ Zero upside risk intact" if jl_upside_free \
-                     else "⚠️ Upside risk no longer eliminated"
-        jl_block = (
-            f"Put credit now:   ${jl_put_credit:.2f}\n"
-            f"Call spread now:  ${jl_call_credit:.2f}\n"
-            f"{upside_tag}\n"
-        )
-
-    return f"""🕐 <b>Late entry check — {symbol}</b>
-Original alert: {original_time}
-Strategy: {STRATEGY_LABELS.get(strategy, strategy)}
-
-<b>Original vs now</b>
-Credit then:  ${original_credit:.2f}
-Credit now:   ${current_credit:.2f}
-{jl_block}{wing_ratios}Credit/width: {current_ratio:.0%}  ·  PoP: {current_pop:.0%}
-IVR: {current_ivr:.0f}  ·  Price vs VWAP: {price_vs_vwap}
-
-<b>Verdict</b>
-{verdict_map.get(verdict, verdict)}
-
-{advice}""".strip()
+    return None
