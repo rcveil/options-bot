@@ -24,9 +24,9 @@ from data.market import get_vix, classify_vix, get_ivr
 from data.candles import fetch_intraday_bars, fetch_avg_volume
 from signals.indicators import run_all, compute_rvol
 from signals.strategy import select_strategy, compute_pop, compute_position_size
-from signals.chain import build_spread, build_iron_condor
-from signals.filters import check_credit_spread, check_debit_spread, check_iron_condor
-from signals.sizing import credit_exits, debit_exits
+from signals.chain import build_spread, build_iron_condor, build_butterfly
+from signals.filters import check_credit_spread, check_debit_spread, check_iron_condor, check_butterfly
+from signals.sizing import credit_exits, debit_exits, butterfly_exits
 from alerts.formatter import SignalPayload, format_signal, format_vix_warning
 from alerts.telegram import send_signal, send_warning, build_application
 from storage.journal import init_db, log_signal
@@ -255,6 +255,92 @@ async def _scan_vertical(
     logger.info(f"{symbol}: SIGNAL SENT ✓ {sell_strike}/{buy_strike} credit=${net_credit:.2f}")
 
 
+async def _scan_butterfly(
+    symbol: str, vix: float, regime: str, ivr: float,
+    price: float, vwap: float, rvol: float, ind: dict, now_et: str,
+) -> None:
+    dte_min, dte_max = 25, 35
+    bf = await build_butterfly(
+        symbol=symbol, underlying_price=price,
+        dte_min=dte_min, dte_max=dte_max,
+    )
+    if bf is None:
+        logger.info(f"{symbol} BF: no valid butterfly")
+        return
+
+    body_g = bf["body_greeks"]
+    result = check_butterfly(
+        debit        = bf["net_debit"],
+        wing_width   = bf["wing_width"],
+        max_profit   = bf["max_profit"],
+        net_delta    = bf["net_delta"],
+        body_bid_ask = body_g["ask"] - body_g["bid"],
+        body_mid     = body_g["mid"],
+        dte          = bf["dte"],
+        open_interest= body_g.get("oi", 999),
+        symbol       = symbol,
+        vix_regime   = regime,
+    )
+
+    if not result.passed:
+        logger.info(f"{symbol} BF: REJECTED — {'; '.join(result.reasons)}")
+        return
+
+    sizing = compute_position_size(ACCOUNT_SIZE, bf["max_loss"] * 100, regime)
+    exits  = butterfly_exits(bf["net_debit"], bf["max_profit"])
+    profit_multiple = round(bf["max_profit"] / bf["net_debit"], 1) if bf["net_debit"] > 0 else 0
+    rationale = (
+        f"No directional bias. IVR {ivr:.0f} in 30–50 range — "
+        f"butterfly lottery ticket. High IV reduces net debit. "
+        f"Price at ${price:.2f}, body strike ${bf['body_strike']:.0f}. "
+        f"RSI {ind['rsi']:.0f}. Max profit {profit_multiple}x debit if stock pins body at expiry."
+    )
+
+    payload = SignalPayload(
+        symbol=symbol, direction="neutral",
+        strategy="long_butterfly", structure="debit",
+        vix=vix, vix_regime=regime, timestamp_et=now_et,
+        expiry=bf["expiry"], dte=bf["dte"],
+        credit_debit=bf["net_debit"], max_loss=bf["max_loss"],
+        ivr=ivr, pop=0.0,   # PoP is not standard for butterfly — depends on pinning
+        contracts=sizing["contracts"],
+        risk_dollars=sizing["risk_dollars"], risk_pct=sizing["risk_pct"],
+        stop_level=exits["stop_value"], profit_target=exits["profit_target"],
+        stop_note=exits["stop_note"], target_note=exits["target_note"],
+        rationale=rationale, rvol=rvol, warnings=result.warnings,
+        # Butterfly-specific fields
+        lower_strike=bf["lower_strike"],
+        body_strike=bf["body_strike"],
+        upper_strike=bf["upper_strike"],
+        wing_width=bf["wing_width"],
+        debit_ratio=bf["debit_ratio"],
+        max_profit=bf["max_profit"],
+        net_delta=bf["net_delta"],
+        # Greeks from body (short legs)
+        delta=body_g["delta"], gamma=body_g.get("gamma", 0.0),
+        theta=body_g.get("theta", 0.0), vega=body_g.get("vega", 0.0),
+        iv=body_g["iv"], open_interest=body_g.get("oi", 0),
+        bid_ask_spread=body_g["ask"] - body_g["bid"],
+        mid_price=body_g["mid"],
+    )
+
+    await send_signal(format_signal(payload))
+    await log_signal({
+        "symbol": symbol, "strategy": "long_butterfly",
+        "direction": "neutral", "structure": "debit",
+        "sell_strike": bf["body_strike"], "buy_strike": bf["lower_strike"],
+        "spread_width": bf["wing_width"], "option_type": "C",
+        "expiry": bf["expiry"], "dte": bf["dte"],
+        "credit_debit": bf["net_debit"], "max_loss": bf["max_loss"],
+        "ivr": ivr, "vix": vix, "vix_regime": regime, "pop": 0.0,
+        "delta": body_g["delta"], "theta": body_g.get("theta", 0.0),
+        "vega": body_g.get("vega", 0.0), "iv": body_g["iv"],
+        "contracts": sizing["contracts"], "risk_dollars": sizing["risk_dollars"],
+        "vwap": vwap, "rvol": rvol, "rationale": rationale, "timestamp_et": now_et,
+    })
+    logger.info(f"{symbol} BF: SIGNAL SENT ✓ {bf['lower_strike']}/{bf['body_strike']}/{bf['upper_strike']} debit=${bf['net_debit']:.2f}")
+
+
 async def scan_ticker(symbol: str, vix: float, regime: str) -> None:
     try:
         df = await fetch_intraday_bars(symbol)
@@ -287,6 +373,10 @@ async def scan_ticker(symbol: str, vix: float, regime: str) -> None:
 
         if decision.strategy == "iron_condor":
             await _scan_iron_condor(
+                symbol, vix, regime, ivr, price, vwap, rvol, ind, now_et
+            )
+        elif decision.strategy == "long_butterfly":
+            await _scan_butterfly(
                 symbol, vix, regime, ivr, price, vwap, rvol, ind, now_et
             )
         else:
