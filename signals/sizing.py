@@ -38,26 +38,18 @@ def debit_exits(debit_paid: float) -> dict:
     }
 
 
-def jade_lizard_exits(total_credit: float) -> dict:
+def butterfly_exits(debit_paid: float, max_profit: float) -> dict:
     """
-    Jade lizard exit levels.
-      Stop:   close entire position if total debit to close reaches 2x credit.
-              Put loss is the primary risk — close before it escalates.
-      Target: close at 50% of total credit received.
-
-    Note: no upside stop needed — call spread width is covered by total credit.
-    Only downside (put side) requires stop management.
+    Butterfly exit levels.
+      Stop:   close at -50% of debit paid (lose half the lottery ticket cost).
+      Target: close at 25% of max profit — butterflies rarely pin perfectly,
+              take partial profit early.
     """
-    stop_at   = round(total_credit * STOP_CREDIT_MULT, 2)
-    target_at = round(total_credit * (1 - PROFIT_TARGET_PCT), 2)
+    stop_at   = round(debit_paid * 0.50, 2)
+    target_at = round(max_profit * 0.25, 2)
     return {
-        "stop_debit":    stop_at,
+        "stop_value":    stop_at,
         "profit_target": target_at,
-        "stop_note":     (
-            f"Close all 3 legs if total debit to close reaches ${stop_at:.2f}. "
-            f"No upside stop needed — call spread is fully covered by credit."
-        ),
-        "target_note":   (
-            f"Take profit at ${target_at:.2f} total credit remaining (50% of max)"
-        ),
+        "stop_note":     f"Close if value drops to ${stop_at:.2f} (−50% of debit)",
+        "target_note":   f"Take profit at ${target_at:.2f} (25% of max profit)",
     }

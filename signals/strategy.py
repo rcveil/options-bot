@@ -1,201 +1,187 @@
 """
 signals/strategy.py
-Strategy selector, Black-Scholes PoP calculator, position sizer.
+Strategy selection, Black-Scholes PoP, position sizing.
 """
 
 import math
+import logging
 from dataclasses import dataclass
-from typing import Literal
 from scipy.stats import norm
 
-from config.thresholds import (
-    IVR_SELL_MIN, IVR_BUY_MAX,
-    DTE_CREDIT_MIN, DTE_CREDIT_MAX,
-    DTE_DEBIT_MIN,  DTE_DEBIT_MAX,
-)
-
-StrategyType = Literal[
-    "bull_put_spread",
-    "bear_call_spread",
-    "iron_condor",
-    "jade_lizard",
-    "bull_call_spread",
-    "bear_put_spread",
-    "no_trade",
-]
+logger = logging.getLogger(__name__)
 
 
 @dataclass
 class StrategyDecision:
-    strategy:    StrategyType
-    structure:   str           # "credit" or "debit"
-    direction:   str           # "bullish" / "bearish" / "neutral"
-    dte_target:  tuple[int, int]
-    rationale:   str
+    strategy:   str
+    structure:  str
+    direction:  str
+    dte_target: tuple[int, int]
+    rationale:  str
 
 
 def select_strategy(
-    direction:  str | None,
-    ivr:        float,
+    direction: str | None,
+    ivr:       float,
     vix_regime: str,
 ) -> StrategyDecision:
     """
-    Core decision tree: IVR × direction → strategy.
-    Rule: long leg must not cost more than short leg yields.
-    Enforced via credit/width ratio gate in filters.py.
+    Route to strategy based on direction + IVR.
+    
+    New logic:
+    - IVR 30-50 + neutral → long butterfly (lottery ticket)
+    - IVR > 50 + neutral → iron condor (premium collection)
+    - All other routing unchanged
     """
-
-    # Neutral + high IV → iron condor
-    if direction is None and ivr >= IVR_SELL_MIN:
-        return StrategyDecision(
-            strategy   = "iron_condor",
-            structure  = "credit",
-            direction  = "neutral",
-            dte_target = (DTE_CREDIT_MIN, DTE_CREDIT_MAX),
-            rationale  = (
-                f"No directional bias. IVR {ivr:.0f} is elevated — "
-                f"selling premium on both sides via iron condor. "
-                f"Theta works from day one."
-            ),
-        )
-
-    # Neutral + low IV → skip
+    # No directional bias
     if direction is None:
-        return StrategyDecision(
-            strategy   = "no_trade",
-            structure  = "",
-            direction  = "neutral",
-            dte_target = (0, 0),
-            rationale  = (
-                f"No directional bias and IVR {ivr:.0f} is low. "
-                f"Insufficient premium to justify a neutral position."
-            ),
-        )
-
-    # High IV → sell premium
-    if ivr >= IVR_SELL_MIN:
-        if direction == "bullish":
+        if ivr > 50:
             return StrategyDecision(
-                strategy   = "jade_lizard",
+                strategy   = "iron_condor",
+                structure  = "credit",
+                direction  = "neutral",
+                dte_target = (21, 45),
+                rationale  = f"No directional bias. IVR {ivr:.0f} > 50 — selling premium both sides.",
+            )
+        elif ivr >= 30:
+            return StrategyDecision(
+                strategy   = "long_butterfly",
+                structure  = "debit",
+                direction  = "neutral",
+                dte_target = (25, 35),
+                rationale  = f"No directional bias. IVR {ivr:.0f} in 30-50 range — butterfly lottery ticket.",
+            )
+        else:
+            return StrategyDecision(
+                strategy   = "no_trade",
+                structure  = "none",
+                direction  = "neutral",
+                dte_target = (0, 0),
+                rationale  = f"No directional bias. IVR {ivr:.0f} < 30 — low IV, no neutral trade.",
+            )
+    
+    # Bullish bias
+    if direction == "bullish":
+        if ivr > 50:
+            return StrategyDecision(
+                strategy   = "bull_put_spread",
                 structure  = "credit",
                 direction  = "bullish",
-                dte_target = (DTE_CREDIT_MIN, DTE_CREDIT_MAX),
-                rationale  = (
-                    f"Bullish bias with IVR {ivr:.0f} — premium is rich. "
-                    f"Jade lizard: short OTM put + short call spread. "
-                    f"Volatility skew makes the put richer than the call. "
-                    f"Zero upside risk when total credit > call spread width."
-                ),
+                dte_target = (21, 45),
+                rationale  = f"Bullish trend. IVR {ivr:.0f} > 50 — sell puts, collect premium.",
             )
-        return StrategyDecision(
-            strategy   = "bear_call_spread",
-            structure  = "credit",
-            direction  = "bearish",
-            dte_target = (DTE_CREDIT_MIN, DTE_CREDIT_MAX),
-            rationale  = (
-                f"Bearish bias with IVR {ivr:.0f} — premium is rich. "
-                f"Selling an OTM call spread above resistance collects "
-                f"credit while giving the stock room to move."
-            ),
-        )
-
-    # Low IV → buy premium
-    if ivr <= IVR_BUY_MAX:
-        if direction == "bullish":
+        elif ivr < 30:
             return StrategyDecision(
                 strategy   = "bull_call_spread",
                 structure  = "debit",
                 direction  = "bullish",
-                dte_target = (DTE_DEBIT_MIN, DTE_DEBIT_MAX),
-                rationale  = (
-                    f"Bullish bias with IVR {ivr:.0f} — IV is cheap. "
-                    f"Buying a call debit spread captures upside without "
-                    f"overpaying for the long leg."
-                ),
+                dte_target = (7, 21),
+                rationale  = f"Bullish trend. IVR {ivr:.0f} < 30 — buy calls, low IV entry.",
             )
-        return StrategyDecision(
-            strategy   = "bear_put_spread",
-            structure  = "debit",
-            direction  = "bearish",
-            dte_target = (DTE_DEBIT_MIN, DTE_DEBIT_MAX),
-            rationale  = (
-                f"Bearish bias with IVR {ivr:.0f} — IV is cheap. "
-                f"Buying a put debit spread captures the downside move."
-            ),
-        )
-
-    # Mid IV (30–50): credit only if signal passes 30% gate
-    if direction == "bullish":
-        return StrategyDecision(
-            strategy   = "bull_put_spread",
-            structure  = "credit",
-            direction  = "bullish",
-            dte_target = (DTE_CREDIT_MIN, DTE_CREDIT_MAX),
-            rationale  = (
-                f"Bullish bias. IVR {ivr:.0f} is mid-range — credit spread "
-                f"only if credit/width >= 30% gate is met, otherwise skip."
-            ),
-        )
+        else:
+            return StrategyDecision(
+                strategy   = "bull_put_spread",
+                structure  = "credit",
+                direction  = "bullish",
+                dte_target = (21, 45),
+                rationale  = f"Bullish trend. IVR {ivr:.0f} in mid-range — credit spread.",
+            )
+    
+    # Bearish bias
+    if direction == "bearish":
+        if ivr > 50:
+            return StrategyDecision(
+                strategy   = "bear_call_spread",
+                structure  = "credit",
+                direction  = "bearish",
+                dte_target = (21, 45),
+                rationale  = f"Bearish trend. IVR {ivr:.0f} > 50 — sell calls, collect premium.",
+            )
+        elif ivr < 30:
+            return StrategyDecision(
+                strategy   = "bear_put_spread",
+                structure  = "debit",
+                direction  = "bearish",
+                dte_target = (7, 21),
+                rationale  = f"Bearish trend. IVR {ivr:.0f} < 30 — buy puts, low IV entry.",
+            )
+        else:
+            return StrategyDecision(
+                strategy   = "bear_call_spread",
+                structure  = "credit",
+                direction  = "bearish",
+                dte_target = (21, 45),
+                rationale  = f"Bearish trend. IVR {ivr:.0f} in mid-range — credit spread.",
+            )
+    
+    # Fallback
     return StrategyDecision(
-        strategy   = "bear_call_spread",
-        structure  = "credit",
-        direction  = "bearish",
-        dte_target = (DTE_CREDIT_MIN, DTE_CREDIT_MAX),
-        rationale  = (
-            f"Bearish bias. IVR {ivr:.0f} is mid-range — credit spread "
-            f"only if credit/width >= 30% gate is met, otherwise skip."
-        ),
+        strategy   = "no_trade",
+        structure  = "none",
+        direction  = "unknown",
+        dte_target = (0, 0),
+        rationale  = "Unknown direction or IVR — no trade.",
     )
 
 
 def compute_pop(
-    underlying_price: float,
-    strike:           float,
-    dte:              int,
-    iv:               float,
-    option_type:      str,   # "P" or "C"
+    current_price: float,
+    strike:        float,
+    dte:           int,
+    iv:            float,
+    option_type:   str,
 ) -> float:
     """
-    Black-Scholes probability of expiring OTM (profit for seller).
-    Returns 0.0–1.0.
+    Black-Scholes probability of profit (OTM at expiry).
+    Returns value 0-1.
     """
-    if iv <= 0 or dte <= 0:
+    if dte <= 0 or iv <= 0:
         return 0.0
-    t  = dte / 365
-    d2 = (
-        math.log(underlying_price / strike)
-        + (-0.5 * iv ** 2) * t
-    ) / (iv * math.sqrt(t))
-    if option_type == "P":
-        return float(norm.cdf(d2))    # prob price stays above strike
-    return float(norm.cdf(-d2))       # prob price stays below strike
+    
+    t     = dte / 365.0
+    sigma = iv
+    s     = current_price
+    k     = strike
+    
+    try:
+        d1 = (math.log(s / k) + (0.5 * sigma ** 2) * t) / (sigma * math.sqrt(t))
+        
+        if option_type == "P":
+            pop = norm.cdf(-d1)
+        else:
+            pop = norm.cdf(d1)
+        
+        return round(pop, 4)
+    except (ValueError, ZeroDivisionError):
+        return 0.0
 
 
 def compute_position_size(
     account_size: float,
     max_loss:     float,
     vix_regime:   str,
-    risk_pct_min: float = 0.02,
-    risk_pct_max: float = 0.05,
 ) -> dict:
     """
-    Calculate position size in contracts.
-    Halves size in elevated/spike regimes.
-    Hard cap: 3 contracts.
+    Position sizing based on VIX regime.
+    
+    Returns contracts, risk_dollars, risk_pct.
     """
-    target_risk = account_size * risk_pct_max
-    if vix_regime in ("elevated", "spike"):
-        target_risk *= 0.5
-
-    if max_loss <= 0:
-        return {"contracts": 1, "risk_dollars": 0.0, "risk_pct": 0.0}
-
-    contracts   = max(1, int(target_risk // max_loss))
-    contracts   = min(contracts, 3)
-    actual_risk = contracts * max_loss
-
+    if vix_regime == "normal":
+        target_risk_pct = 0.05
+    elif vix_regime == "elevated":
+        target_risk_pct = 0.025
+    elif vix_regime == "spike":
+        target_risk_pct = 0.02
+    else:
+        target_risk_pct = 0.02
+    
+    target_risk_dollars = account_size * target_risk_pct
+    contracts           = max(1, min(3, int(target_risk_dollars / max_loss)))
+    actual_risk_dollars = contracts * max_loss
+    actual_risk_pct     = actual_risk_dollars / account_size
+    
     return {
         "contracts":    contracts,
-        "risk_dollars": round(actual_risk, 2),
-        "risk_pct":     round(actual_risk / account_size, 4),
+        "risk_dollars": round(actual_risk_dollars, 2),
+        "risk_pct":     round(actual_risk_pct, 4),
     }
