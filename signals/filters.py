@@ -138,114 +138,7 @@ def check_debit_spread(
                         reasons=reasons, warnings=warnings)
 
 
-def check_jade_lizard(
-    # Put leg
-    put_credit:        float,
-    put_delta:         float,
-    put_bid_ask:       float,
-    put_mid:           float,
-    put_oi:            int,
-    # Call spread
-    call_spread_credit: float,
-    call_spread_width:  float,
-    short_call_delta:  float,
-    call_bid_ask:      float,
-    call_mid:          float,
-    call_oi:           int,
-    # Combined
-    total_credit:      float,
-    upside_risk_free:  bool,
-    pop_put:           float,
-    pop_call:          float,
-    dte:               int,
-    symbol:            str,
-    vix_regime:        str,
-) -> FilterResult:
-    """
-    Jade lizard filter gates.
-
-    Key rule: total credit > call spread width → zero upside risk.
-    This is the defining property of the jade lizard and is a hard gate.
-
-    Put leg: treated like a standalone short put (delta, liquidity, PoP).
-    Call spread: credit/width >= 30%, delta, liquidity.
-    Combined: DTE, PoP on put side.
-    """
-    reasons  = []
-    warnings = _vix_warnings(vix_regime)
-
-    min_oi  = MIN_OPEN_INTEREST_SPX if symbol in INDEX_SYMBOLS \
-              else MIN_OPEN_INTEREST
-    min_pop = MIN_POP_ELEVATED if vix_regime == "elevated" else MIN_POP_CREDIT
-
-    # ── Defining rule: zero upside risk ───────────────────────────────
-    if not upside_risk_free:
-        reasons.append(
-            f"Total credit ${total_credit:.2f} does not exceed call spread "
-            f"width ${call_spread_width:.1f} — upside risk not eliminated"
-        )
-
-    # ── Put leg checks ─────────────────────────────────────────────────
-    abs_put_delta = abs(put_delta)
-    if not (DELTA_SHORT_CREDIT_MIN <= abs_put_delta <= DELTA_SHORT_CREDIT_MAX):
-        reasons.append(
-            f"Put delta {put_delta:.2f} outside "
-            f"{DELTA_SHORT_CREDIT_MIN}–{DELTA_SHORT_CREDIT_MAX}"
-        )
-
-    put_ba_pct = put_bid_ask / put_mid if put_mid > 0 else 1.0
-    if put_ba_pct > MAX_BID_ASK_PCT:
-        reasons.append(f"Put bid/ask {put_ba_pct:.0%} > 10% of mid")
-    elif put_ba_pct > 0.06:
-        warnings.append("Put bid/ask slightly wide — use limit at mid")
-
-    if put_oi < min_oi:
-        reasons.append(f"Put OI {put_oi:,} below {min_oi:,} minimum")
-
-    if pop_put < min_pop:
-        reasons.append(f"Put PoP {pop_put:.0%} below {min_pop:.0%} minimum")
-
-    # ── Call spread checks ─────────────────────────────────────────────
-    call_ratio = call_spread_credit / call_spread_width \
-                 if call_spread_width > 0 else 0
-    if call_ratio < MIN_CREDIT_WIDTH_RATIO:
-        reasons.append(
-            f"Call spread credit/width {call_ratio:.0%} below 30% "
-            f"(${call_spread_credit:.2f} on ${call_spread_width:.1f}-wide)"
-        )
-
-    abs_call_delta = abs(short_call_delta)
-    if not (DELTA_SHORT_CREDIT_MIN <= abs_call_delta <= DELTA_SHORT_CREDIT_MAX):
-        reasons.append(
-            f"Short call delta {short_call_delta:.2f} outside "
-            f"{DELTA_SHORT_CREDIT_MIN}–{DELTA_SHORT_CREDIT_MAX}"
-        )
-
-    call_ba_pct = call_bid_ask / call_mid if call_mid > 0 else 1.0
-    if call_ba_pct > MAX_BID_ASK_PCT:
-        reasons.append(f"Call bid/ask {call_ba_pct:.0%} > 10% of mid")
-    elif call_ba_pct > 0.06:
-        warnings.append("Call bid/ask slightly wide — use limit at mid")
-
-    if call_oi < min_oi:
-        reasons.append(f"Call OI {call_oi:,} below {min_oi:,} minimum")
-
-    # ── Combined checks ────────────────────────────────────────────────
-    if not (DTE_CREDIT_MIN <= dte <= DTE_CREDIT_MAX):
-        reasons.append(f"DTE {dte} outside {DTE_CREDIT_MIN}–{DTE_CREDIT_MAX}")
-
-    # Warn if call PoP is low (stock running toward short call)
-    if pop_call < min_pop:
-        warnings.append(
-            f"Call PoP {pop_call:.0%} below {min_pop:.0%} — "
-            f"stock trending toward short call"
-        )
-
-    return FilterResult(
-        passed   = len(reasons) == 0,
-        reasons  = reasons,
-        warnings = warnings,
-    )
+def check_iron_condor(
     # Put wing
     put_credit:       float,
     put_width:        float,
@@ -344,3 +237,111 @@ def check_jade_lizard(
 
     return FilterResult(passed=len(reasons) == 0,
                         reasons=reasons, warnings=warnings)
+
+
+def check_jade_lizard(
+    # Put leg
+    put_credit:         float,
+    put_delta:          float,
+    put_bid_ask:        float,
+    put_mid:            float,
+    put_oi:             int,
+    # Call spread
+    call_spread_credit: float,
+    call_spread_width:  float,
+    short_call_delta:   float,
+    call_bid_ask:       float,
+    call_mid:           float,
+    call_oi:            int,
+    # Combined
+    total_credit:       float,
+    upside_risk_free:   bool,
+    pop_put:            float,
+    pop_call:           float,
+    dte:                int,
+    symbol:             str,
+    vix_regime:         str,
+) -> FilterResult:
+    """
+    Jade lizard filter gates.
+
+    Defining rule (hard gate): total credit > call spread width → zero upside risk.
+    Put leg: delta, liquidity, PoP checked independently.
+    Call spread: credit/width >= 30%, delta, liquidity checked independently.
+    Combined: DTE. Call PoP below threshold is a warning not a rejection
+    (call side has defined risk regardless).
+    """
+    reasons  = []
+    warnings = _vix_warnings(vix_regime)
+
+    min_oi  = MIN_OPEN_INTEREST_SPX if symbol in INDEX_SYMBOLS \
+              else MIN_OPEN_INTEREST
+    min_pop = MIN_POP_ELEVATED if vix_regime == "elevated" else MIN_POP_CREDIT
+
+    # ── Defining rule: zero upside risk ───────────────────────────────
+    if not upside_risk_free:
+        reasons.append(
+            f"Total credit ${total_credit:.2f} does not exceed call spread "
+            f"width ${call_spread_width:.1f} — upside risk not eliminated"
+        )
+
+    # ── Put leg ────────────────────────────────────────────────────────
+    abs_put_delta = abs(put_delta)
+    if not (DELTA_SHORT_CREDIT_MIN <= abs_put_delta <= DELTA_SHORT_CREDIT_MAX):
+        reasons.append(
+            f"Put delta {put_delta:.2f} outside "
+            f"{DELTA_SHORT_CREDIT_MIN}–{DELTA_SHORT_CREDIT_MAX}"
+        )
+
+    put_ba_pct = put_bid_ask / put_mid if put_mid > 0 else 1.0
+    if put_ba_pct > MAX_BID_ASK_PCT:
+        reasons.append(f"Put bid/ask {put_ba_pct:.0%} of mid — too wide")
+    elif put_ba_pct > 0.06:
+        warnings.append("Put bid/ask slightly wide — use limit at mid")
+
+    if put_oi < min_oi:
+        reasons.append(f"Put OI {put_oi:,} below {min_oi:,} minimum")
+
+    if pop_put < min_pop:
+        reasons.append(f"Put PoP {pop_put:.0%} below {min_pop:.0%} minimum")
+
+    # ── Call spread ────────────────────────────────────────────────────
+    call_ratio = call_spread_credit / call_spread_width \
+                 if call_spread_width > 0 else 0
+    if call_ratio < MIN_CREDIT_WIDTH_RATIO:
+        reasons.append(
+            f"Call spread credit/width {call_ratio:.0%} below 30% "
+            f"(${call_spread_credit:.2f} on ${call_spread_width:.1f}-wide)"
+        )
+
+    abs_call_delta = abs(short_call_delta)
+    if not (DELTA_SHORT_CREDIT_MIN <= abs_call_delta <= DELTA_SHORT_CREDIT_MAX):
+        reasons.append(
+            f"Short call delta {short_call_delta:.2f} outside "
+            f"{DELTA_SHORT_CREDIT_MIN}–{DELTA_SHORT_CREDIT_MAX}"
+        )
+
+    call_ba_pct = call_bid_ask / call_mid if call_mid > 0 else 1.0
+    if call_ba_pct > MAX_BID_ASK_PCT:
+        reasons.append(f"Call bid/ask {call_ba_pct:.0%} of mid — too wide")
+    elif call_ba_pct > 0.06:
+        warnings.append("Call bid/ask slightly wide — use limit at mid")
+
+    if call_oi < min_oi:
+        reasons.append(f"Call OI {call_oi:,} below {min_oi:,} minimum")
+
+    # ── Combined ───────────────────────────────────────────────────────
+    if not (DTE_CREDIT_MIN <= dte <= DTE_CREDIT_MAX):
+        reasons.append(f"DTE {dte} outside {DTE_CREDIT_MIN}–{DTE_CREDIT_MAX}")
+
+    if pop_call < min_pop:
+        warnings.append(
+            f"Call PoP {pop_call:.0%} below {min_pop:.0%} — "
+            f"stock trending toward short call"
+        )
+
+    return FilterResult(
+        passed   = len(reasons) == 0,
+        reasons  = reasons,
+        warnings = warnings,
+    )
