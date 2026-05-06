@@ -1,13 +1,12 @@
 """
 signals/chain.py
-Option chain scanner: best expiry, best spread, iron condor, butterfly.
+Option chain scanner: best expiry, best spread, iron condor.
 
-Butterfly structure:
-- Buy 1 lower strike (ITM call)
-- Sell 2 middle strikes (ATM call)
-- Buy 1 upper strike (OTM call)
-- Equal wing spacing ($5-$10)
-- Net debit trade
+Strike dicts from get_strikes_for_expiry have format:
+    {"strike": 700.0, "C": ".SPY260508C700", "P": ".SPY260508P700"}
+
+get_greeks() builds its own OCC symbol internally — we pass strike + option_type.
+Single chain fetch per symbol — passed through to all functions.
 """
 
 import asyncio
@@ -29,7 +28,6 @@ logger = logging.getLogger(__name__)
 
 CANDIDATE_WIDTHS = [2.5, 5, 7.5, 10, 12.5, 15, 20, 25]
 MIN_CREDIT_RATIO = 0.33
-BUTTERFLY_WING_WIDTHS = [5, 7.5, 10]  # Per-wing spacing for butterflies
 
 
 def _select_expiry_from_chain(
@@ -66,8 +64,8 @@ async def select_expiry(
 async def _find_short_strike(
     symbol:           str,
     expiry:           str,
-    option_type:      str,
-    structure:        str,
+    option_type:      str,       # "C" or "P"
+    structure:        str,       # "credit" or "debit"
     underlying_price: float,
     strikes_data:     list[dict],
 ) -> Optional[dict]:
@@ -272,124 +270,6 @@ async def find_best_spread(
     }
 
 
-async def build_butterfly(
-    symbol:           str,
-    underlying_price: float,
-    dte_min:          int = 25,
-    dte_max:          int = 35,
-) -> Optional[dict]:
-    """
-    Build long call butterfly:
-    - Buy 1 lower strike (ITM)
-    - Sell 2 middle strikes (ATM)
-    - Buy 1 upper strike (OTM)
-    
-    Equal wing spacing. Tries $5, $7.5, $10 widths.
-    Returns first structure where debit/width <= 25%.
-    """
-    logger.info(f"{symbol}: building butterfly (underlying={underlying_price:.2f})")
-
-    chain = await fetch_option_chain(symbol)
-    if not chain:
-        return None
-
-    expiry = _select_expiry_from_chain(chain, symbol, dte_min, dte_max)
-    if not expiry:
-        return None
-
-    strikes_data = get_strikes_for_expiry(chain, expiry, symbol)
-    if not strikes_data:
-        logger.warning(f"{symbol} butterfly: no strikes for {expiry}")
-        return None
-
-    available_strikes = sorted([s["strike"] for s in strikes_data])
-    
-    # Find ATM strike (middle/body)
-    atm_strike = min(available_strikes, key=lambda x: abs(x - underlying_price))
-    
-    today = date.today()
-    dte   = (date.fromisoformat(expiry) - today).days
-
-    # Try each wing width
-    for wing_width in BUTTERFLY_WING_WIDTHS:
-        lower_target = atm_strike - wing_width
-        upper_target = atm_strike + wing_width
-        
-        # Find closest actual strikes
-        lower_strike = min(available_strikes, key=lambda x: abs(x - lower_target), default=None)
-        upper_strike = min(available_strikes, key=lambda x: abs(x - upper_target), default=None)
-        
-        if lower_strike is None or upper_strike is None:
-            continue
-        
-        actual_lower_width = atm_strike - lower_strike
-        actual_upper_width = upper_strike - atm_strike
-        
-        # Wings should be roughly equal
-        if abs(actual_lower_width - actual_upper_width) > 1.0:
-            logger.info(
-                f"{symbol} butterfly: wings unequal "
-                f"(lower={actual_lower_width:.1f} upper={actual_upper_width:.1f}) — skipping"
-            )
-            continue
-        
-        # Fetch greeks for all 3 strikes
-        try:
-            lower_g = await get_greeks(symbol, expiry, lower_strike, "C")
-            atm_g   = await get_greeks(symbol, expiry, atm_strike,   "C")
-            upper_g = await get_greeks(symbol, expiry, upper_strike, "C")
-        except Exception as e:
-            logger.warning(f"{symbol} butterfly wing_width={wing_width}: greeks failed — {e}")
-            continue
-        
-        # Net debit = buy lower + buy upper - sell 2x ATM
-        net_debit = lower_g["mid"] + upper_g["mid"] - (2 * atm_g["mid"])
-        
-        if net_debit <= 0:
-            logger.info(f"{symbol} butterfly wing_width={wing_width}: net_debit <= 0 — skipping")
-            continue
-        
-        # Max profit = wing width - debit
-        max_profit = actual_lower_width - net_debit
-        
-        if max_profit <= 0:
-            logger.info(f"{symbol} butterfly wing_width={wing_width}: max_profit <= 0 — skipping")
-            continue
-        
-        # Debit/width ratio (lower is better, want < 25%)
-        debit_ratio = net_debit / actual_lower_width
-        
-        # Combined delta should be near-neutral
-        net_delta = lower_g["delta"] - (2 * atm_g["delta"]) + upper_g["delta"]
-        
-        logger.info(
-            f"{symbol} butterfly: wing_width=${actual_lower_width:.1f} "
-            f"strikes={lower_strike}/{atm_strike}/{upper_strike} "
-            f"debit=${net_debit:.2f} ratio={debit_ratio:.0%} "
-            f"max_profit=${max_profit:.2f} delta={net_delta:.3f}"
-        )
-        
-        return {
-            "lower_strike":  lower_strike,
-            "body_strike":   atm_strike,
-            "upper_strike":  upper_strike,
-            "wing_width":    round(actual_lower_width, 2),
-            "net_debit":     round(net_debit, 2),
-            "debit_ratio":   round(debit_ratio, 4),
-            "max_profit":    round(max_profit, 2),
-            "max_loss":      round(net_debit, 2),
-            "net_delta":     round(net_delta, 4),
-            "lower_greeks":  lower_g,
-            "body_greeks":   atm_g,
-            "upper_greeks":  upper_g,
-            "expiry":        expiry,
-            "dte":           dte,
-        }
-    
-    logger.warning(f"{symbol} butterfly: no valid structure found across all wing widths")
-    return None
-
-
 async def build_iron_condor(
     symbol:           str,
     underlying_price: float,
@@ -456,6 +336,153 @@ async def build_iron_condor(
         "expiry":            expiry,
         "dte":               dte,
     }
+
+
+async def build_jade_lizard(
+    symbol:           str,
+    underlying_price: float,
+    dte_min:          int,
+    dte_max:          int,
+    call_widths:      list[float] = [5.0, 10.0],
+) -> Optional[dict]:
+    """
+    Build jade lizard: short OTM put + short call spread.
+
+    Structure:
+      Leg 1: Sell put  at ~0.20 delta (OTM, below market)
+      Leg 2: Sell call at ~0.20 delta (OTM, above market)
+      Leg 3: Buy  call at short_call_strike + width ($5 or $10)
+
+    The defining rule: total credit > call spread width → zero upside risk.
+    Tries $5 width first, then $10 if $5 fails the no-upside-risk check.
+
+    Returns dict with all 3 legs, total credit, upside_risk_free flag.
+    """
+    logger.info(f"{symbol}: building jade lizard (underlying={underlying_price:.2f})")
+
+    chain = await fetch_option_chain(symbol)
+    if not chain:
+        return None
+
+    expiry = _select_expiry_from_chain(chain, symbol, dte_min, dte_max)
+    if not expiry:
+        return None
+
+    strikes_data = get_strikes_for_expiry(chain, expiry, symbol)
+    if not strikes_data:
+        logger.warning(f"{symbol} JL: no strikes for {expiry}")
+        return None
+
+    today        = date.today()
+    dte          = (date.fromisoformat(expiry) - today).days
+    available    = sorted([s["strike"] for s in strikes_data])
+
+    # ── Leg 1: Short put at ~0.20 delta ───────────────────────────────
+    short_put = await _find_short_strike(
+        symbol, expiry, "P", "credit", underlying_price, strikes_data,
+    )
+    if short_put is None:
+        logger.warning(f"{symbol} JL: no short put found")
+        return None
+
+    put_credit = short_put["greeks"]["mid"]
+
+    # ── Leg 2 + 3: Short call spread at ~0.20 delta ───────────────────
+    short_call = await _find_short_strike(
+        symbol, expiry, "C", "credit", underlying_price, strikes_data,
+    )
+    if short_call is None:
+        logger.warning(f"{symbol} JL: no short call found")
+        return None
+
+    call_credit_solo = short_call["greeks"]["mid"]
+
+    # Try each call spread width — prefer narrowest that satisfies no-upside-risk
+    best_result = None
+
+    for width in call_widths:
+        target_long_call = short_call["strike"] + width
+        long_call_strike = min(
+            available,
+            key=lambda x: abs(x - target_long_call),
+            default=None,
+        )
+        if long_call_strike is None:
+            continue
+
+        actual_width = long_call_strike - short_call["strike"]
+        if actual_width < 1.0:
+            continue
+
+        try:
+            long_call_g = await get_greeks(symbol, expiry, long_call_strike, "C")
+        except Exception as e:
+            logger.warning(f"{symbol} JL: long call greeks failed at {long_call_strike} — {e}")
+            continue
+
+        call_spread_credit = round(call_credit_solo - long_call_g["mid"], 2)
+        if call_spread_credit <= 0:
+            logger.info(f"{symbol} JL: call spread credit <= 0 at width=${actual_width:.1f} — skipping")
+            continue
+
+        total_credit       = round(put_credit + call_spread_credit, 2)
+        upside_risk_free   = total_credit > actual_width
+        call_spread_ratio  = call_spread_credit / actual_width if actual_width > 0 else 0
+
+        # Downside max loss: unlimited below breakeven
+        # Practical max loss (for sizing): short put strike - total credit (breakeven)
+        breakeven          = round(short_put["strike"] - total_credit, 2)
+        # For position sizing use put strike * 0.20 as representative downside
+        sizing_max_loss    = round(short_put["strike"] * 0.20, 2)
+
+        logger.info(
+            f"{symbol} JL: put={short_put['strike']} short_call={short_call['strike']} "
+            f"long_call={long_call_strike} width=${actual_width:.1f} "
+            f"put_credit=${put_credit:.2f} call_spread=${call_spread_credit:.2f} "
+            f"total=${total_credit:.2f} upside_risk_free={upside_risk_free}"
+        )
+
+        result = {
+            # Put leg
+            "put_strike":         short_put["strike"],
+            "put_credit":         round(put_credit, 2),
+            "put_greeks":         short_put["greeks"],
+            # Call spread legs
+            "short_call_strike":  short_call["strike"],
+            "long_call_strike":   long_call_strike,
+            "call_spread_width":  round(actual_width, 2),
+            "call_spread_credit": call_spread_credit,
+            "call_spread_ratio":  round(call_spread_ratio, 4),
+            "short_call_greeks":  short_call["greeks"],
+            "long_call_greeks":   long_call_g,
+            # Combined
+            "total_credit":       total_credit,
+            "upside_risk_free":   upside_risk_free,
+            "breakeven":          breakeven,
+            "sizing_max_loss":    sizing_max_loss,
+            "expiry":             expiry,
+            "dte":                dte,
+        }
+
+        if upside_risk_free:
+            logger.info(f"{symbol} JL: ✓ zero upside risk — total credit ${total_credit:.2f} > width ${actual_width:.1f}")
+            return result
+
+        # Keep as best_result in case no width achieves zero upside risk
+        if best_result is None:
+            best_result = result
+
+    if best_result:
+        logger.warning(
+            f"{symbol} JL: no width achieved zero upside risk — "
+            f"best total credit ${best_result['total_credit']:.2f} vs "
+            f"width ${best_result['call_spread_width']:.1f}. "
+            f"filters.py will flag this."
+        )
+        return best_result
+
+    logger.warning(f"{symbol} JL: could not build any valid structure")
+    return None
 
 
 async def build_spread(
