@@ -19,6 +19,7 @@ StrategyType = Literal[
     "bear_call_spread",
     "iron_condor",
     "jade_lizard",
+    "long_butterfly",
     "bull_call_spread",
     "bear_put_spread",
     "no_trade",
@@ -56,6 +57,20 @@ def select_strategy(
                 f"No directional bias. IVR {ivr:.0f} is elevated — "
                 f"selling premium on both sides via iron condor. "
                 f"Theta works from day one."
+            ),
+        )
+
+    # Neutral + mid IV (30-50) → long butterfly lottery ticket
+    if direction is None and ivr >= IVR_BUY_MAX:
+        return StrategyDecision(
+            strategy   = "long_butterfly",
+            structure  = "debit",
+            direction  = "neutral",
+            dte_target = (25, 35),
+            rationale  = (
+                f"No directional bias. IVR {ivr:.0f} in 30–50 range — "
+                f"butterfly lottery ticket. High IV reduces net debit cost. "
+                f"Max profit if stock pins body strike at expiry."
             ),
         )
 

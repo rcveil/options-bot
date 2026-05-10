@@ -7,6 +7,8 @@ Iron condor: each wing is validated independently against the per-wing 1/3 rule.
 from dataclasses import dataclass, field
 from config.thresholds import (
     MIN_CREDIT_WIDTH_RATIO, MIN_POP_CREDIT, MIN_POP_ELEVATED,
+    MIN_POP_IC_COMBINED, MIN_POP_IC_COMBINED_ELEV,
+    MAX_BUTTERFLY_DEBIT_RATIO, MIN_BUTTERFLY_PROFIT_RATIO,
     MAX_BID_ASK_PCT, MIN_OPEN_INTEREST, MIN_OPEN_INTEREST_SPX,
     DELTA_SHORT_CREDIT_MIN, DELTA_SHORT_CREDIT_MAX,
     DELTA_LONG_DEBIT_MIN, DELTA_LONG_DEBIT_MAX,
@@ -169,7 +171,7 @@ def check_iron_condor(
 
     min_oi  = MIN_OPEN_INTEREST_SPX if symbol in INDEX_SYMBOLS \
               else MIN_OPEN_INTEREST
-    min_pop = MIN_POP_ELEVATED if vix_regime == "elevated" else MIN_POP_CREDIT
+    min_pop = MIN_POP_IC_COMBINED_ELEV if vix_regime == "elevated" else MIN_POP_IC_COMBINED
 
     # ── Put wing checks ────────────────────────────────────────────────
     put_ratio = put_credit / put_width if put_width > 0 else 0
