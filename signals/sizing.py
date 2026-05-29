@@ -61,3 +61,20 @@ def jade_lizard_exits(total_credit: float) -> dict:
             f"Take profit at ${target_at:.2f} total credit remaining (50% of max)"
         ),
     }
+
+
+def butterfly_exits(net_debit: float, max_profit: float) -> dict:
+    """
+    Butterfly exit levels.
+      Stop:   close at -50% of debit paid (lose half the lottery ticket).
+      Target: close at 25% of max profit — butterflies rarely pin perfectly,
+              take partial profit early rather than waiting for expiry.
+    """
+    stop_at   = round(net_debit * 0.50, 2)
+    target_at = round(max_profit * 0.25, 2)
+    return {
+        "stop_value":    stop_at,
+        "profit_target": target_at,
+        "stop_note":     f"Close if value drops to ${stop_at:.2f} (−50% of debit paid)",
+        "target_note":   f"Take profit at ${target_at:.2f} (25% of max profit)",
+    }

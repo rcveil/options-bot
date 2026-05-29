@@ -517,3 +517,114 @@ async def build_spread(
         symbol, expiry, option_type, structure,
         direction, underlying_price, strikes_data,
     )
+
+
+async def build_butterfly(
+    symbol:           str,
+    underlying_price: float,
+    dte_min:          int = 25,
+    dte_max:          int = 35,
+    wing_widths:      list[float] = [5.0, 7.5, 10.0],
+) -> Optional[dict]:
+    """
+    Build long call butterfly:
+      Buy  1 lower strike (ITM)
+      Sell 2 body strikes  (ATM)
+      Buy  1 upper strike  (OTM)
+    Equal wing spacing. Tries $5, $7.5, $10.
+    Returns first structure where debit/width <= 30%.
+    """
+    logger.info(f"{symbol}: building butterfly (underlying={underlying_price:.2f})")
+
+    chain = await fetch_option_chain(symbol)
+    if not chain:
+        return None
+
+    expiry = _select_expiry_from_chain(chain, symbol, dte_min, dte_max)
+    if not expiry:
+        return None
+
+    strikes_data = get_strikes_for_expiry(chain, expiry, symbol)
+    if not strikes_data:
+        logger.warning(f"{symbol} BF: no strikes for {expiry}")
+        return None
+
+    available = sorted([s["strike"] for s in strikes_data])
+    today     = date.today()
+    dte       = (date.fromisoformat(expiry) - today).days
+
+    # Body strike = closest to current price (ATM)
+    body_strike = min(available, key=lambda x: abs(x - underlying_price))
+
+    for wing_width in wing_widths:
+        lower_target = body_strike - wing_width
+        upper_target = body_strike + wing_width
+
+        lower_strike = min(available, key=lambda x: abs(x - lower_target))
+        upper_strike = min(available, key=lambda x: abs(x - upper_target))
+
+        actual_lower = body_strike - lower_strike
+        actual_upper = upper_strike - body_strike
+
+        # Wings must be roughly equal
+        if abs(actual_lower - actual_upper) > 1.0:
+            logger.info(
+                f"{symbol} BF: wings unequal at width=${wing_width:.1f} "
+                f"(lower={actual_lower:.1f} upper={actual_upper:.1f}) — skipping"
+            )
+            continue
+
+        actual_wing = round((actual_lower + actual_upper) / 2, 2)
+
+        try:
+            lower_g = await get_greeks(symbol, expiry, lower_strike, "C")
+            body_g  = await get_greeks(symbol, expiry, body_strike,  "C")
+            upper_g = await get_greeks(symbol, expiry, upper_strike, "C")
+        except Exception as e:
+            logger.warning(f"{symbol} BF wing=${wing_width:.1f}: greeks failed — {e}")
+            continue
+
+        # Net debit = buy lower + buy upper - sell 2x body
+        net_debit  = round(lower_g["mid"] + upper_g["mid"] - (2 * body_g["mid"]), 2)
+        if net_debit <= 0:
+            logger.info(f"{symbol} BF wing=${wing_width:.1f}: net_debit={net_debit:.2f} <= 0 — skipping")
+            continue
+
+        max_profit   = round(actual_wing - net_debit, 2)
+        if max_profit <= 0:
+            logger.info(f"{symbol} BF wing=${wing_width:.1f}: max_profit={max_profit:.2f} <= 0 — skipping")
+            continue
+
+        debit_ratio  = round(net_debit / actual_wing, 4)
+        profit_ratio = round(max_profit / net_debit, 2)
+        net_delta    = round(
+            lower_g["delta"] - (2 * body_g["delta"]) + upper_g["delta"], 4
+        )
+
+        logger.info(
+            f"{symbol} BF: {lower_strike}/{body_strike}/{upper_strike} "
+            f"wing=${actual_wing:.1f} debit=${net_debit:.2f} "
+            f"ratio={debit_ratio:.0%} max_profit=${max_profit:.2f} "
+            f"({profit_ratio:.1f}x) delta={net_delta:.3f}"
+        )
+
+        return {
+            "lower_strike":  lower_strike,
+            "body_strike":   body_strike,
+            "upper_strike":  upper_strike,
+            "wing_width":    actual_wing,
+            "net_debit":     net_debit,
+            "debit_ratio":   debit_ratio,
+            "max_profit":    max_profit,
+            "profit_ratio":  profit_ratio,
+            "max_loss":      net_debit,   # max loss = debit paid
+            "net_delta":     net_delta,
+            "lower_greeks":  lower_g,
+            "body_greeks":   body_g,
+            "upper_greeks":  upper_g,
+            "expiry":        expiry,
+            "dte":           dte,
+        }
+
+    logger.warning(f"{symbol} BF: no valid structure found across all wing widths")
+    return None

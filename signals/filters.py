@@ -347,3 +347,66 @@ def check_jade_lizard(
         reasons  = reasons,
         warnings = warnings,
     )
+
+
+def check_butterfly(
+    debit:          float,
+    wing_width:     float,
+    max_profit:     float,
+    net_delta:      float,
+    body_bid_ask:   float,
+    body_mid:       float,
+    dte:            int,
+    open_interest:  int,
+    symbol:         str,
+    vix_regime:     str,
+) -> FilterResult:
+    """
+    Long butterfly filter gates.
+    - Debit/width < 30% (cheap entry relative to structure)
+    - Max profit / debit >= 1.5x (reward/risk ratio)
+    - Net delta near-neutral (|delta| < 0.15)
+    - Body bid/ask <= 10% of mid
+    - DTE 25–35 days
+    - OI >= minimum
+    """
+    reasons  = []
+    warnings = _vix_warnings(vix_regime)
+
+    min_oi      = MIN_OPEN_INTEREST_SPX if symbol in INDEX_SYMBOLS \
+                  else MIN_OPEN_INTEREST
+    debit_ratio  = debit / wing_width if wing_width > 0 else 999
+    profit_ratio = max_profit / debit if debit > 0 else 0
+    ba_pct       = body_bid_ask / body_mid if body_mid > 0 else 999
+
+    if debit_ratio > MAX_BUTTERFLY_DEBIT_RATIO:
+        reasons.append(
+            f"Debit/width {debit_ratio:.0%} above {MAX_BUTTERFLY_DEBIT_RATIO:.0%} maximum"
+        )
+
+    if profit_ratio < MIN_BUTTERFLY_PROFIT_RATIO:
+        reasons.append(
+            f"Max profit/debit {profit_ratio:.1f}x below {MIN_BUTTERFLY_PROFIT_RATIO:.1f}x minimum"
+        )
+
+    if abs(net_delta) > 0.15:
+        warnings.append(
+            f"Net delta {net_delta:.3f} not fully neutral — slight directional risk"
+        )
+
+    if ba_pct > MAX_BID_ASK_PCT:
+        reasons.append(f"Body bid/ask {ba_pct:.0%} of mid — too wide")
+    elif ba_pct > 0.06:
+        warnings.append("Body bid/ask slightly wide — use limit at mid")
+
+    if dte < 25 or dte > 35:
+        reasons.append(f"DTE {dte} outside 25–35 butterfly window")
+
+    if open_interest < min_oi:
+        reasons.append(f"OI {open_interest:,} below {min_oi:,} minimum")
+
+    return FilterResult(
+        passed   = len(reasons) == 0,
+        reasons  = reasons,
+        warnings = warnings,
+    )
