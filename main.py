@@ -5,6 +5,13 @@ Scans every 10 minutes during market hours: 09:30–16:00 ET weekdays.
 Uses pure async time checking — no schedule library.
 Heartbeat every 5 minutes confirms loop is alive.
 /scan command triggers scan immediately from Telegram.
+
+Conviction rules (from thresholds.py):
+  - CONVICTION_HIGH  (3-of-3): jade_lizard, iron_condor, debit spreads
+  - CONVICTION_NORMAL (2-of-3): bull_put_spread, bear_call_spread
+
+ORB gate: first scan requires MIN_BARS_FOR_SCAN (15) bars so the
+opening range is fully formed before any signal fires.
 """
 
 import asyncio
@@ -19,14 +26,16 @@ from config.watchlist import ALL_SYMBOLS, INDEX_ONLY
 from config.thresholds import (
     DTE_CREDIT_MIN, DTE_CREDIT_MAX,
     DTE_DEBIT_MIN,  DTE_DEBIT_MAX,
+    CONVICTION_HIGH, CONVICTION_NORMAL,
+    MIN_BARS_FOR_SCAN,
 )
 from data.market import get_vix, classify_vix, get_ivr
 from data.candles import fetch_intraday_bars, fetch_avg_volume
 from signals.indicators import run_all, compute_rvol
 from signals.strategy import select_strategy, compute_pop, compute_position_size
-from signals.chain import build_spread, build_iron_condor, build_jade_lizard, build_butterfly
-from signals.filters import check_credit_spread, check_debit_spread, check_iron_condor, check_jade_lizard, check_butterfly
-from signals.sizing import credit_exits, debit_exits, jade_lizard_exits, butterfly_exits
+from signals.chain import build_spread, build_iron_condor, build_jade_lizard
+from signals.filters import check_credit_spread, check_debit_spread, check_iron_condor, check_jade_lizard
+from signals.sizing import credit_exits, debit_exits, jade_lizard_exits
 from alerts.formatter import SignalPayload, format_signal, format_vix_warning
 from alerts.telegram import send_signal, send_warning, build_application
 from storage.journal import init_db, log_signal
@@ -46,6 +55,9 @@ MARKET_CLOSE_MINUTE = 0
 
 # Scan interval in minutes
 SCAN_INTERVAL_MINUTES = 10
+
+# Strategies requiring 3-of-3 indicator conviction
+HIGH_CONVICTION_STRATEGIES = {"jade_lizard", "iron_condor", "bull_call_spread", "bear_put_spread"}
 
 # Tracks the last scan time — "YYYY-MM-DD HH:MM" in ET
 # Prevents double-firing within the same 10-minute window
@@ -68,6 +80,12 @@ def _current_scan_slot(now: datetime) -> str:
     """
     slot_minute = (now.minute // SCAN_INTERVAL_MINUTES) * SCAN_INTERVAL_MINUTES
     return now.strftime(f"%Y-%m-%d %H:") + f"{slot_minute:02d}"
+
+
+def _required_conviction(strategy: str) -> int:
+    """Return the minimum conviction count required for a given strategy."""
+    return CONVICTION_HIGH if strategy in HIGH_CONVICTION_STRATEGIES \
+           else CONVICTION_NORMAL
 
 
 async def _scan_iron_condor(
@@ -328,7 +346,6 @@ async def _scan_jade_lizard(
         stop_level=exits["stop_debit"], profit_target=exits["profit_target"],
         stop_note=exits["stop_note"], target_note=exits["target_note"],
         rationale=rationale, rvol=rvol, warnings=result.warnings,
-        # Jade lizard-specific fields
         jl_put_strike         = jl["put_strike"],
         jl_put_credit         = jl["put_credit"],
         jl_short_call_strike  = jl["short_call_strike"],
@@ -355,7 +372,6 @@ async def _scan_jade_lizard(
         "vega": put_g.get("vega", 0.0), "iv": put_g["iv"],
         "contracts": sizing["contracts"], "risk_dollars": sizing["risk_dollars"],
         "vwap": vwap, "rvol": rvol, "rationale": rationale, "timestamp_et": now_et,
-        # Jade lizard journal fields
         "jl_put_strike":         jl["put_strike"],
         "jl_put_credit":         jl["put_credit"],
         "jl_short_call_strike":  jl["short_call_strike"],
@@ -375,101 +391,20 @@ async def _scan_jade_lizard(
     )
 
 
-async def _scan_butterfly(
-    symbol: str, vix: float, regime: str, ivr: float,
-    price: float, vwap: float, rvol: float, ind: dict, now_et: str,
-) -> None:
-    bf = await build_butterfly(
-        symbol=symbol, underlying_price=price,
-        dte_min=25, dte_max=35,
-    )
-    if bf is None:
-        logger.info(f"{symbol} BF: no valid butterfly")
-        return
-
-    body_g = bf["body_greeks"]
-    result = check_butterfly(
-        debit         = bf["net_debit"],
-        wing_width    = bf["wing_width"],
-        max_profit    = bf["max_profit"],
-        net_delta     = bf["net_delta"],
-        body_bid_ask  = body_g["ask"] - body_g["bid"],
-        body_mid      = body_g["mid"],
-        dte           = bf["dte"],
-        open_interest = body_g.get("oi", 999),
-        symbol        = symbol,
-        vix_regime    = regime,
-    )
-
-    if not result.passed:
-        logger.info(f"{symbol} BF: REJECTED — {'; '.join(result.reasons)}")
-        return
-
-    sizing = compute_position_size(ACCOUNT_SIZE, bf["max_loss"] * 100, regime)
-    exits  = butterfly_exits(bf["net_debit"], bf["max_profit"])
-    profit_multiple = round(bf["max_profit"] / bf["net_debit"], 1) if bf["net_debit"] > 0 else 0
-    rationale = (
-        f"No directional bias. IVR {ivr:.0f} in 30–50 range — butterfly lottery ticket. "
-        f"High IV reduces net debit cost. "
-        f"Body strike ${bf['body_strike']:.0f}, wings ${bf['lower_strike']:.0f}/${bf['upper_strike']:.0f}. "
-        f"Max profit {profit_multiple}x debit if stock pins body at expiry. RSI {ind['rsi']:.0f}."
-    )
-
-    payload = SignalPayload(
-        symbol=symbol, direction="neutral",
-        strategy="long_butterfly", structure="debit",
-        vix=vix, vix_regime=regime, timestamp_et=now_et,
-        sell_strike=bf["body_strike"], buy_strike=bf["lower_strike"],
-        expiry=bf["expiry"], dte=bf["dte"],
-        credit_debit=bf["net_debit"], max_loss=bf["max_loss"],
-        ivr=ivr, pop=0.0,
-        contracts=sizing["contracts"],
-        risk_dollars=sizing["risk_dollars"], risk_pct=sizing["risk_pct"],
-        stop_level=exits["stop_value"], profit_target=exits["profit_target"],
-        stop_note=exits["stop_note"], target_note=exits["target_note"],
-        rationale=rationale, rvol=rvol, warnings=result.warnings,
-        delta=body_g["delta"], gamma=body_g.get("gamma", 0.0),
-        theta=body_g.get("theta", 0.0), vega=body_g.get("vega", 0.0),
-        iv=body_g["iv"], open_interest=body_g.get("oi", 0),
-        bid_ask_spread=body_g["ask"] - body_g["bid"],
-        mid_price=body_g["mid"],
-        credit_width_ratio=bf["debit_ratio"],
-        # Butterfly-specific fields
-        bf_lower_strike = bf["lower_strike"],
-        bf_body_strike  = bf["body_strike"],
-        bf_upper_strike = bf["upper_strike"],
-        bf_wing_width   = bf["wing_width"],
-        bf_debit_ratio  = bf["debit_ratio"],
-        bf_max_profit   = bf["max_profit"],
-        bf_net_delta    = bf["net_delta"],
-    )
-
-    await send_signal(format_signal(payload))
-    await log_signal({
-        "symbol": symbol, "strategy": "long_butterfly",
-        "direction": "neutral", "structure": "debit",
-        "sell_strike": bf["body_strike"], "buy_strike": bf["lower_strike"],
-        "spread_width": bf["wing_width"], "option_type": "C",
-        "expiry": bf["expiry"], "dte": bf["dte"],
-        "credit_debit": bf["net_debit"], "max_loss": bf["max_loss"],
-        "ivr": ivr, "vix": vix, "vix_regime": regime, "pop": 0.0,
-        "delta": body_g["delta"], "theta": body_g.get("theta", 0.0),
-        "vega": body_g.get("vega", 0.0), "iv": body_g["iv"],
-        "contracts": sizing["contracts"], "risk_dollars": sizing["risk_dollars"],
-        "vwap": vwap, "rvol": rvol, "rationale": rationale, "timestamp_et": now_et,
-    })
-    logger.info(
-        f"{symbol} BF: SIGNAL SENT ✓ "
-        f"{bf['lower_strike']}/{bf['body_strike']}/{bf['upper_strike']} "
-        f"debit=${bf['net_debit']:.2f} max_profit=${bf['max_profit']:.2f}"
-    )
-
-
 async def scan_ticker(symbol: str, vix: float, regime: str) -> None:
     try:
         df = await fetch_intraday_bars(symbol)
         if df.empty or len(df) < 5:
             logger.info(f"{symbol}: SKIP — only {len(df)} bars")
+            return
+
+        # ── ORB gate: require at least 15 bars before acting ──────────
+        if len(df) < MIN_BARS_FOR_SCAN:
+            logger.info(
+                f"{symbol}: SKIP — only {len(df)} bars, "
+                f"need {MIN_BARS_FOR_SCAN} for complete ORB "
+                f"(scan will fire from ~09:45 ET onwards)"
+            )
             return
 
         avg_vol  = await fetch_avg_volume(symbol)
@@ -479,20 +414,30 @@ async def scan_ticker(symbol: str, vix: float, regime: str) -> None:
             logger.info(f"{symbol}: SKIP — indicators empty")
             return
 
-        direction = ind["direction"]
-        price     = ind["price"]
-        vwap      = ind["vwap"]
-        ivr       = await get_ivr(symbol)
-        now_et    = datetime.now(ET).strftime("%H:%M ET")
-        decision  = select_strategy(direction, ivr, regime)
+        direction       = ind["direction"]
+        conviction      = ind["conviction_count"]
+        price           = ind["price"]
+        vwap            = ind["vwap"]
+        ivr             = await get_ivr(symbol)
+        now_et          = datetime.now(ET).strftime("%H:%M ET")
+        decision        = select_strategy(direction, ivr, regime)
 
         logger.info(
-            f"{symbol}: direction={direction} IVR={ivr:.0f} "
-            f"strategy={decision.strategy}"
+            f"{symbol}: direction={direction} conviction={conviction}/3 "
+            f"IVR={ivr:.0f} strategy={decision.strategy}"
         )
 
         if decision.strategy == "no_trade":
             logger.info(f"{symbol}: SKIP no_trade")
+            return
+
+        # ── Conviction gate ───────────────────────────────────────────
+        required = _required_conviction(decision.strategy)
+        if conviction < required:
+            logger.info(
+                f"{symbol}: SKIP — conviction {conviction}/3 below "
+                f"{required}/3 required for {decision.strategy}"
+            )
             return
 
         if decision.strategy == "iron_condor":
@@ -501,10 +446,6 @@ async def scan_ticker(symbol: str, vix: float, regime: str) -> None:
             )
         elif decision.strategy == "jade_lizard":
             await _scan_jade_lizard(
-                symbol, vix, regime, ivr, price, vwap, rvol, ind, now_et
-            )
-        elif decision.strategy == "long_butterfly":
-            await _scan_butterfly(
                 symbol, vix, regime, ivr, price, vwap, rvol, ind, now_et
             )
         else:
@@ -578,6 +519,10 @@ async def scheduler_loop() -> None:
         f"Scheduler started — scanning every {SCAN_INTERVAL_MINUTES} min "
         f"during market hours (09:30–16:00 ET weekdays)"
     )
+    logger.info(
+        f"ORB gate active — first effective signals from ~09:45 ET "
+        f"(requires {MIN_BARS_FOR_SCAN} bars)"
+    )
     heartbeat_counter = 0
 
     while True:
@@ -616,6 +561,10 @@ async def main() -> None:
         f"Scan schedule: every {SCAN_INTERVAL_MINUTES} min "
         f"from 09:30 to 16:00 ET weekdays "
         f"(up to {(390 // SCAN_INTERVAL_MINUTES)} scans per day)"
+    )
+    logger.info(
+        f"Conviction gates: 3-of-3 for {sorted(HIGH_CONVICTION_STRATEGIES)}, "
+        f"2-of-3 for standard credit spreads"
     )
 
     tg_app = build_application()
