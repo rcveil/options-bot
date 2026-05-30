@@ -51,6 +51,15 @@ class SignalPayload:
     jl_pop_put:            Optional[float] = None
     jl_pop_call:           Optional[float] = None
 
+    # Butterfly fields (None for other strategies)
+    bf_lower_strike: Optional[float] = None
+    bf_body_strike:  Optional[float] = None
+    bf_upper_strike: Optional[float] = None
+    bf_wing_width:   Optional[float] = None
+    bf_debit_ratio:  Optional[float] = None
+    bf_max_profit:   Optional[float] = None
+    bf_net_delta:    Optional[float] = None
+
     # Threshold values
     ivr:                float = 50.0
     credit_width_ratio: float = 0.0
@@ -170,6 +179,27 @@ def _format_jade_lizard(p: SignalPayload) -> str:
     )
 
 
+def _format_butterfly(p: SignalPayload) -> str:
+    """Format message for long butterfly (3 strikes, all calls)."""
+    profit_multiple = round(p.bf_max_profit / p.credit_debit, 1)                       if p.credit_debit and p.credit_debit > 0 else 0
+    return (
+        f"<b>Trade structure</b>\n"
+        f"Buy call  {p.bf_lower_strike:.0f}"
+        f"  ·  Sell 2× call  {p.bf_body_strike:.0f}"
+        f"  ·  Buy call  {p.bf_upper_strike:.0f}\n"
+        f"Wing width  ${p.bf_wing_width:.1f}"
+        f"  ·  Net delta  {p.bf_net_delta:+.3f}\n"
+        f"Expiry  {p.expiry}  ·  {p.dte} DTE\n"
+        f"Net debit  −${p.credit_debit:.2f}"
+        f"  ·  Max profit  ${p.bf_max_profit:.2f}  ({profit_multiple}× debit)"
+        f"  ·  Max loss  ${p.max_loss:.2f}\n\n"
+        f"<b>Entry gates</b>\n"
+        f"IVR {p.ivr:.0f}"
+        f"  ·  Debit/width {p.bf_debit_ratio:.0%}"
+        f"  ·  Body bid/ask ${p.bid_ask_spread:.2f}"
+    )
+
+
 def format_signal(p: SignalPayload) -> str:
     regime_tag    = f"{REGIME_ICON.get(p.vix_regime, '')} VIX {p.vix:.1f} — {p.vix_regime.upper()}"
     direction_tag = f"{DIRECTION_ICON.get(p.direction, '')} {p.direction.upper()}"
@@ -182,12 +212,19 @@ def format_signal(p: SignalPayload) -> str:
         trade_block = _format_iron_condor(p)
     elif p.strategy == "jade_lizard":
         trade_block = _format_jade_lizard(p)
+    elif p.strategy == "long_butterfly":
+        trade_block = _format_butterfly(p)
     else:
         trade_block = _format_vertical(p, structure_tag, credit_sign)
 
     warning_block = ""
     if p.warnings:
         warning_block = "\n\n" + "\n".join(f"⚠️ {w}" for w in p.warnings)
+
+    if p.strategy == "long_butterfly":
+        pop_line = "N/A (max profit if stock pins body strike at expiry)"
+    else:
+        pop_line = f"{pop_bar}  {p.pop:.0%}"
 
     return f"""{regime_tag}
 {p.timestamp_et}
@@ -202,7 +239,7 @@ def format_signal(p: SignalPayload) -> str:
 IV {p.iv:.1%}  ·  OI {p.open_interest:,}
 
 <b>Probability of profit</b>
-{pop_bar}  {p.pop:.0%}
+{pop_line}
 
 <b>Suggested size</b>
 {p.contracts} contract{'s' if p.contracts > 1 else ''}  ·  Risk ${p.risk_dollars:,.0f} ({p.risk_pct:.1%} of account)
