@@ -8,6 +8,10 @@ ORB uses all available bars — still valid as a partial range.
 
 All indicators operate on the full session from 09:30 ET so
 VWAP anchors correctly from open regardless of scan time.
+
+run_all() now returns conviction_count (0–3) alongside direction.
+This allows main.py to enforce 3-of-3 for high-risk structures
+and 2-of-3 for standard credit spreads.
 """
 
 import logging
@@ -77,9 +81,16 @@ def get_direction_bias(
     ema9:   float,
     ema21:  float,
     orb:    dict,
-) -> Optional[str]:
+) -> tuple[Optional[str], int]:
     """
-    Requires 2 of 3 conditions to agree.
+    Requires 2 of 3 conditions to agree for a directional signal.
+    Returns (direction, conviction_count) where conviction_count is
+    the number of indicators agreeing with the returned direction (0–3).
+
+    conviction_count is used by main.py to enforce stricter gates:
+      - 3-of-3 required for jade lizard, iron condor, debit spreads
+      - 2-of-3 sufficient for bull put / bear call spreads
+
     Logs each condition so you can see exactly why direction is None.
     """
     signals = []
@@ -121,14 +132,23 @@ def get_direction_bias(
     bull = signals.count("bullish")
     bear = signals.count("bearish")
 
-    direction = "bullish" if bull >= 2 else "bearish" if bear >= 2 else None
+    if bull >= 2:
+        direction       = "bullish"
+        conviction_count = bull
+    elif bear >= 2:
+        direction        = "bearish"
+        conviction_count = bear
+    else:
+        direction        = None
+        conviction_count = max(bull, bear)
 
     logger.info(
         f"{symbol}: VWAP={vwap_str} | EMA={ema_str} | ORB={orb_str} "
-        f"→ direction={direction} (bull={bull} bear={bear})"
+        f"→ direction={direction} (bull={bull} bear={bear} "
+        f"conviction={conviction_count}/3)"
     )
 
-    return direction
+    return direction, conviction_count
 
 
 def run_all(df: pd.DataFrame, symbol: str = "?") -> dict:
@@ -156,7 +176,9 @@ def run_all(df: pd.DataFrame, symbol: str = "?") -> dict:
 
     orb = compute_orb(df, minutes=15)
 
-    direction = get_direction_bias(symbol, latest, vwap, ema9, ema21, orb)
+    direction, conviction_count = get_direction_bias(
+        symbol, latest, vwap, ema9, ema21, orb
+    )
 
     logger.info(
         f"{symbol}: price={latest:.2f} VWAP={vwap:.2f} "
@@ -166,13 +188,15 @@ def run_all(df: pd.DataFrame, symbol: str = "?") -> dict:
     )
 
     return {
-        "price":     round(latest,    4),
-        "vwap":      round(vwap,      4),
-        "ema9":      round(ema9,      4),
-        "ema21":     round(ema21,     4),
-        "rsi":       round(rsi,       2),
-        "macd_hist": round(macd_hist, 4),
-        "orb_high":  round(orb["high"], 4),
-        "orb_low":   round(orb["low"],  4),
-        "direction": direction,
+        "price":           round(latest,    4),
+        "vwap":            round(vwap,      4),
+        "ema9":            round(ema9,      4),
+        "ema21":           round(ema21,     4),
+        "rsi":             round(rsi,       2),
+        "macd_hist":       round(macd_hist, 4),
+        "orb_high":        round(orb["high"], 4),
+        "orb_low":         round(orb["low"],  4),
+        "orb_bars":        orb["bars"],
+        "direction":       direction,
+        "conviction_count": conviction_count,
     }
