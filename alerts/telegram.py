@@ -1,11 +1,23 @@
 """
 alerts/telegram.py
 Telegram bot sender and command handlers.
-Commands: /check /status /help /test /scan
-/scan triggers the full scan immediately — useful for testing outside 09:30 ET.
+
+Commands:
+  /check SYMBOL       — re-evaluate latest signal for late entry
+  /status             — bot health, VIX, server time
+  /help               — command list
+  /test               — test Tastytrade connection
+  /scan               — trigger full scan immediately
+  /close SYMBOL       — log outcome for most recent signal (interactive)
+  /export             — export last 30 days of signals as CSV
+  /export YYYY-MM-DD  — export signals from that date onwards
 """
 
+import csv
+import io
 import logging
+from datetime import date, timedelta
+
 from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
@@ -52,6 +64,8 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("help",   handle_help))
     app.add_handler(CommandHandler("test",   handle_test))
     app.add_handler(CommandHandler("scan",   handle_scan))
+    app.add_handler(CommandHandler("close",  handle_close))
+    app.add_handler(CommandHandler("export", handle_export))
     return app
 
 
@@ -103,6 +117,7 @@ async def handle_status(
         f"Tech:    MSFT GOOGL AMZN AAPL\n"
         f"Index:   SPX SPY QQQ\n\n"
         f"Next scan: weekdays at 09:30 ET (21:30 SGT)\n"
+        f"Signals fire from ~09:45 ET (ORB gate)\n"
         f"Use /scan to trigger immediately"
     )
 
@@ -112,11 +127,14 @@ async def handle_help(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     await update.message.reply_text(
-        "/check SYMBOL  —  re-evaluate latest signal\n"
-        "/status        —  bot health, VIX, server time\n"
-        "/test          —  test Tastytrade connection\n"
-        "/scan          —  trigger full scan NOW\n"
-        "/help          —  this message"
+        "/check SYMBOL          — re-evaluate latest signal\n"
+        "/status                — bot health, VIX, server time\n"
+        "/test                  — test Tastytrade connection\n"
+        "/scan                  — trigger full scan NOW\n"
+        "/close SYMBOL          — log trade outcome\n"
+        "/export                — export last 30 days as CSV\n"
+        "/export YYYY-MM-DD     — export from date as CSV\n"
+        "/help                  — this message"
     )
 
 
@@ -186,10 +204,218 @@ async def handle_scan(
         "Signals will arrive in this chat if any pass all filters."
     )
     try:
-        # Import here to avoid circular import
         from main import run_scan
         await run_scan()
         await update.message.reply_text("✅ Scan complete.")
     except Exception as e:
         logger.error(f"/scan error: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Scan error: {e}")
+
+
+async def handle_close(
+    update:  Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    /close SYMBOL
+    Shows the last 5 signals for the symbol so the user can pick
+    which one to close, then prompts for a close price.
+
+    Two-step flow:
+      Step 1: /close SYMBOL  → bot lists recent signals numbered 1–5
+      Step 2: /close SYMBOL N PRICE  → logs the outcome
+
+    Examples:
+      /close NVDA              → lists recent NVDA signals
+      /close NVDA 1 2.40       → closes signal #1 at $2.40
+    """
+    if not context.args:
+        await update.message.reply_text(
+            "Usage:\n"
+            "  /close SYMBOL           — list recent signals\n"
+            "  /close SYMBOL N PRICE   — log close at price\n\n"
+            "Example:\n"
+            "  /close NVDA\n"
+            "  /close NVDA 1 2.40"
+        )
+        return
+
+    symbol = context.args[0].upper()
+
+    # ── Step 2: user supplied a signal number and close price ──────────
+    if len(context.args) == 3:
+        try:
+            pick        = int(context.args[1])
+            close_price = float(context.args[2])
+        except ValueError:
+            await update.message.reply_text(
+                "Could not parse arguments.\n"
+                "Usage: /close SYMBOL N PRICE\n"
+                "Example: /close NVDA 1 2.40"
+            )
+            return
+
+        from storage.journal import get_recent_signals, log_outcome
+        signals = await get_recent_signals(symbol, limit=5)
+
+        if not signals:
+            await update.message.reply_text(f"No signals found for {symbol}.")
+            return
+
+        if pick < 1 or pick > len(signals):
+            await update.message.reply_text(
+                f"Pick must be between 1 and {len(signals)}."
+            )
+            return
+
+        sig        = signals[pick - 1]
+        signal_id  = sig["id"]
+        entry_credit = sig.get("credit_debit", 0) or 0
+
+        # P&L: for credit spreads, profit = entry_credit - close_price
+        # For debit spreads, profit = close_price - entry_credit
+        structure = sig.get("structure", "credit")
+        if structure == "credit":
+            pnl = round((entry_credit - close_price) * 100, 2)
+            exit_reason = (
+                "profit_target" if close_price <= entry_credit * 0.5
+                else "stop_loss" if close_price >= entry_credit * 2
+                else "manual_close"
+            )
+        else:
+            pnl = round((close_price - entry_credit) * 100, 2)
+            exit_reason = (
+                "profit_target" if close_price >= entry_credit * 1.5
+                else "stop_loss" if close_price <= entry_credit * 0.5
+                else "manual_close"
+            )
+
+        await log_outcome(signal_id, close_price, pnl, exit_reason)
+
+        pnl_sign = "+" if pnl >= 0 else ""
+        await update.message.reply_text(
+            f"✅ Outcome logged for {symbol} signal #{pick}\n"
+            f"Signal ID: {signal_id}\n"
+            f"Entry credit: ${entry_credit:.2f}\n"
+            f"Close price:  ${close_price:.2f}\n"
+            f"P&L:          {pnl_sign}${pnl:.2f} per contract\n"
+            f"Exit reason:  {exit_reason}"
+        )
+        return
+
+    # ── Step 1: list recent signals for this symbol ────────────────────
+    from storage.journal import get_recent_signals
+    signals = await get_recent_signals(symbol, limit=5)
+
+    if not signals:
+        await update.message.reply_text(f"No signals found for {symbol}.")
+        return
+
+    lines = [f"Recent signals for {symbol} — reply with /close {symbol} N PRICE\n"]
+    for i, sig in enumerate(signals, 1):
+        strategy    = sig.get("strategy", "?")
+        direction   = sig.get("direction", "?")
+        credit      = sig.get("credit_debit", 0) or 0
+        expiry      = sig.get("expiry", "?")
+        created_at  = (sig.get("created_at") or "")[:16]
+
+        # Build strike description depending on strategy
+        if strategy == "iron_condor":
+            ps = sig.get("put_sell_strike")
+            cs = sig.get("call_sell_strike")
+            strikes = f"put {ps:.0f} / call {cs:.0f}" if ps and cs else "—"
+        elif sig.get("sell_strike"):
+            sell = sig["sell_strike"]
+            buy  = sig.get("buy_strike")
+            strikes = f"{sell:.0f}/{buy:.0f}" if buy else f"{sell:.0f}"
+        else:
+            strikes = "—"
+
+        lines.append(
+            f"{i}. [{created_at}] {strategy} {direction} "
+            f"| {strikes} exp {expiry} | credit ${credit:.2f}"
+        )
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def handle_export(
+    update:  Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    /export             — export last 30 days of signals as CSV
+    /export YYYY-MM-DD  — export signals from that date onwards
+
+    Sends the CSV as a file attachment directly in Telegram.
+    """
+    # Parse optional date argument
+    if context.args:
+        from_date_str = context.args[0]
+        try:
+            date.fromisoformat(from_date_str)   # validate format
+        except ValueError:
+            await update.message.reply_text(
+                "Invalid date format. Use YYYY-MM-DD.\n"
+                "Example: /export 2026-04-01"
+            )
+            return
+    else:
+        from_date_str = (date.today() - timedelta(days=30)).isoformat()
+
+    await update.message.reply_text(
+        f"⏳ Exporting signals from {from_date_str}..."
+    )
+
+    try:
+        from storage.journal import get_signals_since
+        signals = await get_signals_since(from_date_str)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Export failed: {e}")
+        return
+
+    if not signals:
+        await update.message.reply_text(
+            f"No signals found from {from_date_str} onwards."
+        )
+        return
+
+    # Build CSV in memory
+    output   = io.StringIO()
+    fieldnames = [
+        "id", "created_at", "timestamp_et",
+        "symbol", "strategy", "direction", "structure",
+        "sell_strike", "buy_strike", "spread_width", "option_type",
+        "put_sell_strike", "put_buy_strike", "put_credit", "put_credit_ratio",
+        "call_sell_strike", "call_buy_strike", "call_credit", "call_credit_ratio",
+        "wing_width",
+        "jl_put_strike", "jl_put_credit",
+        "jl_short_call_strike", "jl_long_call_strike",
+        "jl_call_spread_width", "jl_call_spread_credit",
+        "jl_call_spread_ratio", "jl_upside_risk_free", "jl_breakeven",
+        "expiry", "dte", "credit_debit", "max_loss",
+        "ivr", "vix", "vix_regime",
+        "pop", "delta", "theta", "vega", "iv",
+        "contracts", "risk_dollars", "vwap", "rvol", "rationale",
+    ]
+    writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(signals)
+
+    # Send as file attachment
+    csv_bytes = output.getvalue().encode("utf-8")
+    filename  = f"signals_{from_date_str}_to_{date.today().isoformat()}.csv"
+
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    async with bot:
+        await bot.send_document(
+            chat_id  = update.effective_chat.id,
+            document = io.BytesIO(csv_bytes),
+            filename = filename,
+            caption  = (
+                f"📊 {len(signals)} signals from {from_date_str} "
+                f"to {date.today().isoformat()}"
+            ),
+        )
+
+    logger.info(f"/export: sent {len(signals)} rows from {from_date_str}")
