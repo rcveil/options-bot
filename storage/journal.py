@@ -215,6 +215,54 @@ async def get_latest_signal(symbol: str) -> dict | None:
         return dict(row) if row else None
 
 
+async def get_recent_signals(symbol: str, limit: int = 5) -> list[dict]:
+    """Return the N most recent signals for a symbol."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT id, strategy, direction, sell_strike, buy_strike,
+                   put_sell_strike, call_sell_strike,
+                   credit_debit, expiry, dte, created_at
+            FROM   signals
+            WHERE  symbol = ?
+            ORDER  BY created_at DESC
+            LIMIT  ?
+        """, (symbol, limit))
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_signals_since(from_date: str) -> list[dict]:
+    """
+    Return all signals created on or after from_date (YYYY-MM-DD).
+    Used by the /export command.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT
+                id, created_at, timestamp_et,
+                symbol, strategy, direction, structure,
+                sell_strike, buy_strike, spread_width, option_type,
+                put_sell_strike, put_buy_strike, put_credit, put_credit_ratio,
+                call_sell_strike, call_buy_strike, call_credit, call_credit_ratio,
+                wing_width,
+                jl_put_strike, jl_put_credit,
+                jl_short_call_strike, jl_long_call_strike,
+                jl_call_spread_width, jl_call_spread_credit,
+                jl_call_spread_ratio, jl_upside_risk_free, jl_breakeven,
+                expiry, dte, credit_debit, max_loss,
+                ivr, vix, vix_regime,
+                pop, delta, theta, vega, iv,
+                contracts, risk_dollars, vwap, rvol, rationale
+            FROM   signals
+            WHERE  date(created_at) >= date(?)
+            ORDER  BY created_at ASC
+        """, (from_date,))
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
 async def log_outcome(
     signal_id:   int,
     close_price: float,
