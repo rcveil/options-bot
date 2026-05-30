@@ -23,10 +23,19 @@ DELTA_LONG_DEBIT_MIN   = 0.40
 DELTA_LONG_DEBIT_MAX   = 0.60   # slightly wider (was 0.55)
 
 # DTE targets
-DTE_CREDIT_MIN = 21
+DTE_CREDIT_MIN = 28   # raised from 21 — avoids gamma risk in final 3 weeks
 DTE_CREDIT_MAX = 45
 DTE_DEBIT_MIN  = 7
 DTE_DEBIT_MAX  = 21
+
+# Conviction thresholds (number of indicators required to agree)
+# 3-of-3 required for high-risk structures (jade lizard, iron condor, debit spreads)
+# 2-of-3 sufficient for defined-risk credit spreads (bull put, bear call)
+CONVICTION_HIGH  = 3   # jade_lizard, iron_condor, bull_call_spread, bear_put_spread
+CONVICTION_NORMAL = 2  # bull_put_spread, bear_call_spread
+
+# Minimum bars before first scan is valid (ensures full 15-min ORB)
+MIN_BARS_FOR_SCAN = 15
 
 # Risk management
 MAX_RISK_PCT      = 0.05   # 5% account max
