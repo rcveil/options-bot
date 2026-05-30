@@ -434,6 +434,14 @@ async def _scan_butterfly(
         bid_ask_spread=body_g["ask"] - body_g["bid"],
         mid_price=body_g["mid"],
         credit_width_ratio=bf["debit_ratio"],
+        # Butterfly-specific fields
+        bf_lower_strike = bf["lower_strike"],
+        bf_body_strike  = bf["body_strike"],
+        bf_upper_strike = bf["upper_strike"],
+        bf_wing_width   = bf["wing_width"],
+        bf_debit_ratio  = bf["debit_ratio"],
+        bf_max_profit   = bf["max_profit"],
+        bf_net_delta    = bf["net_delta"],
     )
 
     await send_signal(format_signal(payload))
