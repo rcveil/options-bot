@@ -11,6 +11,7 @@ Commands:
   /close SYMBOL       — log outcome for most recent signal (interactive)
   /export             — export last 30 days of signals as CSV
   /export YYYY-MM-DD  — export signals from that date onwards
+  /backtest           — P&L report for all settled signals
 """
 
 import csv
@@ -57,15 +58,35 @@ async def send_text(message: str) -> None:
             logger.error(f"Telegram send_text error: {e}")
 
 
+async def handle_backtest(
+    update:  Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """/backtest — show P&L report for all settled signals."""
+    from storage.journal import get_all_outcomes
+    from backtest.report import format_report
+
+    await update.message.reply_text("📊 Generating backtest report...")
+    try:
+        rows     = await get_all_outcomes()
+        messages = format_report(rows)
+        for msg in messages:
+            await update.message.reply_text(msg)
+    except Exception as e:
+        logger.error(f"handle_backtest error: {e}", exc_info=True)
+        await update.message.reply_text(f"Error generating report: {e}")
+
+
 def build_application() -> Application:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("check",  handle_check))
-    app.add_handler(CommandHandler("status", handle_status))
-    app.add_handler(CommandHandler("help",   handle_help))
-    app.add_handler(CommandHandler("test",   handle_test))
-    app.add_handler(CommandHandler("scan",   handle_scan))
-    app.add_handler(CommandHandler("close",  handle_close))
-    app.add_handler(CommandHandler("export", handle_export))
+    app.add_handler(CommandHandler("check",    handle_check))
+    app.add_handler(CommandHandler("status",   handle_status))
+    app.add_handler(CommandHandler("help",     handle_help))
+    app.add_handler(CommandHandler("test",     handle_test))
+    app.add_handler(CommandHandler("scan",     handle_scan))
+    app.add_handler(CommandHandler("close",    handle_close))
+    app.add_handler(CommandHandler("export",   handle_export))
+    app.add_handler(CommandHandler("backtest", handle_backtest))
     return app
 
 
@@ -134,6 +155,7 @@ async def handle_help(
         "/close SYMBOL          — log trade outcome\n"
         "/export                — export last 30 days as CSV\n"
         "/export YYYY-MM-DD     — export from date as CSV\n"
+        "/backtest              — P&L report for all settled signals\n"
         "/help                  — this message"
     )
 
