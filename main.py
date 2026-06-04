@@ -16,7 +16,7 @@ opening range is fully formed before any signal fires.
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 from telegram import Update
@@ -38,7 +38,7 @@ from signals.filters import check_credit_spread, check_debit_spread, check_iron_
 from signals.sizing import credit_exits, debit_exits, jade_lizard_exits
 from alerts.formatter import SignalPayload, format_signal, format_vix_warning
 from alerts.telegram import send_signal, send_warning, build_application
-from storage.journal import init_db, log_signal
+from storage.journal import init_db, log_signal, log_outcome, get_signals_expiring_on
 
 logging.basicConfig(
     level  = logging.INFO,
@@ -62,6 +62,10 @@ HIGH_CONVICTION_STRATEGIES = {"jade_lizard", "iron_condor", "bull_call_spread", 
 # Tracks the last scan time — "YYYY-MM-DD HH:MM" in ET
 # Prevents double-firing within the same 10-minute window
 _last_scan_slot: str = ""
+
+# Tracks the last date the expiry settlement job ran
+# Prevents double-firing on the same calendar day
+_last_close_date: date | None = None
 
 
 def _is_market_open(now: datetime) -> bool:
@@ -391,6 +395,64 @@ async def _scan_jade_lizard(
     )
 
 
+async def run_expiry_settlement(today: date) -> None:
+    """
+    Run at 16:00 ET each weekday. Finds signals expiring today that have
+    no outcome yet, fetches the underlying closing price via yfinance,
+    calculates P&L, and stores the result in the outcomes table.
+
+    Manual /close entries are preserved — get_signals_expiring_on()
+    skips any signal that already has an outcomes row.
+    """
+    from backtest.engine import fetch_close_price, calc_pnl
+
+    date_str = today.isoformat()
+    signals  = await get_signals_expiring_on(date_str)
+
+    if not signals:
+        logger.info(f"Settlement: no unsettled signals expiring on {date_str}")
+        return
+
+    logger.info(f"Settlement: {len(signals)} signal(s) expiring on {date_str}")
+    settled = 0
+
+    for sig in signals:
+        symbol = sig["symbol"]
+        try:
+            close = await asyncio.get_event_loop().run_in_executor(
+                None, fetch_close_price, symbol, date_str
+            )
+            if close is None:
+                logger.warning(f"Settlement: no close price for {symbol} {date_str} — skipping")
+                continue
+
+            pnl = calc_pnl(sig, close)
+            if pnl is None:
+                logger.info(
+                    f"Settlement: {symbol} strategy={sig['strategy']} not supported — skipping"
+                )
+                continue
+
+            await log_outcome(
+                signal_id   = sig["id"],
+                close_price = close,
+                pnl         = pnl,
+                exit_reason = "expiry_calculated",
+            )
+            sign = "+" if pnl >= 0 else ""
+            logger.info(
+                f"Settlement: {symbol} {sig['strategy']} "
+                f"expiry={date_str} close={close:.2f} "
+                f"P&L={sign}${pnl:.2f}"
+            )
+            settled += 1
+
+        except Exception as e:
+            logger.error(f"Settlement: error for {symbol} signal id={sig['id']}: {e}", exc_info=True)
+
+    logger.info(f"Settlement complete: {settled}/{len(signals)} signals settled for {date_str}")
+
+
 async def scan_ticker(symbol: str, vix: float, regime: str) -> None:
     try:
         df = await fetch_intraday_bars(symbol)
@@ -523,6 +585,7 @@ async def scheduler_loop() -> None:
         f"ORB gate active — first effective signals from ~09:45 ET "
         f"(requires {MIN_BARS_FOR_SCAN} bars)"
     )
+    global _last_close_date
     heartbeat_counter = 0
 
     while True:
@@ -548,6 +611,20 @@ async def scheduler_loop() -> None:
                         f"(slot={slot})"
                     )
                     await run_scan()
+
+        # ── Market-close settlement job ───────────────────────────────
+        # Fires once per weekday at 16:00 ET (within the first 30s)
+        # Calculates P&L for any signals that expired today
+        if (
+            now.weekday() < 5
+            and now.hour == MARKET_CLOSE_HOUR
+            and now.minute == MARKET_CLOSE_MINUTE
+            and now.second < 30
+            and _last_close_date != now.date()
+        ):
+            _last_close_date = now.date()
+            logger.info(f"Market close — running expiry settlement for {now.date()}")
+            await run_expiry_settlement(now.date())
 
         await asyncio.sleep(30)
 
