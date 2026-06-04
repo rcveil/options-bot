@@ -263,6 +263,56 @@ async def get_signals_since(from_date: str) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+async def get_signals_expiring_on(date_str: str) -> list[dict]:
+    """
+    Return all signals expiring on date_str (YYYY-MM-DD) that do not
+    already have an outcome row — so manual /close entries are preserved.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT s.*
+            FROM   signals s
+            LEFT JOIN outcomes o ON o.signal_id = s.id
+            WHERE  s.expiry = ?
+              AND  o.id IS NULL
+        """, (date_str,))
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_all_outcomes() -> list[dict]:
+    """
+    Return all outcome rows joined with their signal data.
+    Used by the /backtest command to build the performance report.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT
+                s.id,
+                s.symbol,
+                s.strategy,
+                s.direction,
+                s.structure,
+                s.credit_debit,
+                s.contracts,
+                s.ivr,
+                s.vix,
+                s.vix_regime,
+                s.expiry,
+                s.created_at,
+                o.pnl,
+                o.exit_reason,
+                o.closed_at
+            FROM   outcomes o
+            JOIN   signals  s ON s.id = o.signal_id
+            ORDER  BY o.closed_at ASC
+        """)
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
 async def log_outcome(
     signal_id:   int,
     close_price: float,
