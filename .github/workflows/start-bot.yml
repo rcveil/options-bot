@@ -1,1 +1,25 @@
+name: Start options bot
 
+# Fires at 9:25 AM ET Mon–Fri (5 min before market open)
+# Two cron entries cover EDT (UTC-4) and EST (UTC-5)
+on:
+  schedule:
+    - cron: '25 13 * * 1-5'   # 09:25 AM EDT  (Mar–Nov)
+    - cron: '25 14 * * 1-5'   # 09:25 AM EST  (Nov–Mar)
+  workflow_dispatch:           # allow manual trigger from GitHub UI
+
+jobs:
+  start-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Start Fly machine
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          machine_id=$(flyctl machine list --app options-bot --json | \
+            python3 -c "import json,sys; print(json.load(sys.stdin)[0]['id'])")
+          echo "Starting machine: $machine_id"
+          flyctl machine start "$machine_id" --app options-bot
