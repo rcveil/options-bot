@@ -62,16 +62,62 @@ async def handle_backtest(
     update:  Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """/backtest — show P&L report for all settled signals."""
-    from storage.journal import get_all_outcomes
+    """/backtest — show P&L report for all settled signals.
+    Auto-backfills any expired signals that have no outcome yet
+    (e.g. signals from before the settlement feature was deployed).
+    """
+    from storage.journal import get_all_outcomes, get_all_expired_without_outcomes
+    from backtest.engine import fetch_close_price, calc_pnl
     from backtest.report import format_report
+    from storage.journal import log_outcome
+    import asyncio
 
-    await update.message.reply_text("📊 Generating backtest report...")
     try:
+        # ── Auto-backfill missing outcomes ────────────────────────────
+        pending = await get_all_expired_without_outcomes()
+        if pending:
+            await update.message.reply_text(
+                f"⏳ Found {len(pending)} expired signal(s) with no outcome yet — "
+                f"backfilling now, this may take a moment..."
+            )
+            settled = 0
+            skipped = 0
+            for sig in pending:
+                symbol   = sig["symbol"]
+                expiry   = sig["expiry"]
+                try:
+                    close = await asyncio.get_event_loop().run_in_executor(
+                        None, fetch_close_price, symbol, expiry
+                    )
+                    if close is None:
+                        skipped += 1
+                        continue
+                    pnl = calc_pnl(sig, close)
+                    if pnl is None:
+                        skipped += 1
+                        continue
+                    await log_outcome(
+                        signal_id   = sig["id"],
+                        close_price = close,
+                        pnl         = pnl,
+                        exit_reason = "expiry_calculated",
+                    )
+                    settled += 1
+                except Exception as e:
+                    logger.warning(f"Backfill failed for {symbol} {expiry}: {e}")
+                    skipped += 1
+
+            summary = f"✅ Backfill complete: {settled} settled"
+            if skipped:
+                summary += f", {skipped} skipped (butterfly / no price data)"
+            await update.message.reply_text(summary)
+
+        # ── Generate report ───────────────────────────────────────────
         rows     = await get_all_outcomes()
         messages = format_report(rows)
         for msg in messages:
             await update.message.reply_text(msg)
+
     except Exception as e:
         logger.error(f"handle_backtest error: {e}", exc_info=True)
         await update.message.reply_text(f"Error generating report: {e}")
