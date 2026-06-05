@@ -16,6 +16,7 @@ opening range is fully formed before any signal fires.
 
 import asyncio
 import logging
+import os
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
@@ -46,6 +47,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 ET     = ZoneInfo(TIMEZONE)
+SGT    = ZoneInfo("Asia/Singapore")
 
 # Market hours ET
 MARKET_OPEN_HOUR   = 9
@@ -395,6 +397,48 @@ async def _scan_jade_lizard(
     )
 
 
+async def _fly_stop_self() -> None:
+    """
+    Stop this Fly.io machine via the Machines API so it is fully deallocated
+    (not just process-exited). Falls back to sys.exit(0) when running locally.
+
+    Requires two env vars on the Fly machine:
+      FLY_MACHINE_ID  — injected automatically by Fly
+      FLY_API_TOKEN   — set via: fly secrets set FLY_API_TOKEN=$(fly auth token)
+    """
+    import aiohttp
+
+    machine_id = os.getenv("FLY_MACHINE_ID")
+    app_name   = os.getenv("FLY_APP_NAME", "options-bot")
+    token      = os.getenv("FLY_API_TOKEN")
+
+    if not machine_id or not token:
+        logger.info("Not on Fly.io or FLY_API_TOKEN not set — exiting process")
+        raise SystemExit(0)
+
+    url = f"https://api.machines.dev/v1/apps/{app_name}/machines/{machine_id}/stop"
+    logger.info(f"Stopping Fly machine {machine_id} ({app_name}) via API")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status in (200, 204):
+                    logger.info("Fly stop signal accepted — machine shutting down")
+                else:
+                    body = await resp.text()
+                    logger.warning(
+                        f"Fly stop API returned {resp.status}: {body[:200]} "
+                        "— falling back to sys.exit"
+                    )
+    except Exception as e:
+        logger.warning(f"Fly stop API error: {e} — falling back to sys.exit")
+
+    raise SystemExit(0)
+
+
 async def run_expiry_settlement(today: date) -> None:
     """
     Run at 16:00 ET each weekday. Finds signals expiring today that have
@@ -625,6 +669,18 @@ async def scheduler_loop() -> None:
             _last_close_date = now.date()
             logger.info(f"Market close — running expiry settlement for {now.date()}")
             await run_expiry_settlement(now.date())
+
+        # ── Daily shutdown at 10:00 AM SGT ────────────────────────────
+        # Stops the Fly machine so it is fully deallocated.
+        # GitHub Actions restarts it at 9:25 AM ET each weekday.
+        # SGT has no DST so 10:00 AM SGT = 02:00 UTC always.
+        now_sgt = datetime.now(SGT)
+        if now_sgt.hour == 10 and now_sgt.minute == 0 and now_sgt.second < 30:
+            logger.info(
+                f"10:00 AM SGT — scheduled daily shutdown. "
+                f"GitHub Actions will restart at 9:25 AM ET."
+            )
+            await _fly_stop_self()
 
         await asyncio.sleep(30)
 
