@@ -426,17 +426,14 @@ async def _fly_stop_self() -> None:
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status in (200, 204):
-                    logger.info("Fly stop signal accepted — machine shutting down")
+                    logger.info("Fly stop signal accepted — exiting cleanly")
                 else:
                     body = await resp.text()
                     logger.warning(
-                        f"Fly stop API returned {resp.status}: {body[:200]} "
-                        "— falling back to sys.exit"
+                        f"Fly stop API returned {resp.status}: {body[:200]}"
                     )
     except Exception as e:
-        logger.warning(f"Fly stop API error: {e} — falling back to sys.exit")
-
-    raise SystemExit(0)
+        logger.warning(f"Fly stop API error: {e}")
 
 
 async def run_expiry_settlement(today: date) -> None:
@@ -677,10 +674,11 @@ async def scheduler_loop() -> None:
         now_sgt = datetime.now(SGT)
         if now_sgt.hour == 10 and now_sgt.minute == 0 and now_sgt.second < 30:
             logger.info(
-                f"10:00 AM SGT — scheduled daily shutdown. "
-                f"GitHub Actions will restart at 9:25 AM ET."
+                "10:00 AM SGT — scheduled daily shutdown. "
+                "GitHub Actions will restart at 9:25 AM ET."
             )
             await _fly_stop_self()
+            return   # Exit scheduler_loop cleanly → Telegram app shuts down gracefully
 
         await asyncio.sleep(30)
 
