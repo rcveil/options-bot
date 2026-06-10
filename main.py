@@ -69,6 +69,10 @@ _last_scan_slot: str = ""
 # Prevents double-firing on the same calendar day
 _last_close_date: date | None = None
 
+# Tracks the last date the daily shutdown was triggered
+# Prevents re-triggering multiple times within the 10 AM SGT hour
+_last_shutdown_date: date | None = None
+
 
 def _is_market_open(now: datetime) -> bool:
     """True if now is within 09:30–16:00 ET on a weekday."""
@@ -413,8 +417,8 @@ async def _fly_stop_self() -> None:
     token      = os.getenv("FLY_API_TOKEN")
 
     if not machine_id or not token:
-        logger.info("Not on Fly.io or FLY_API_TOKEN not set — exiting process")
-        raise SystemExit(0)
+        logger.info("Not on Fly.io or FLY_API_TOKEN not set — skipping API stop (local dev)")
+        return  # scheduler_loop's `return` after this call exits the process cleanly
 
     url = f"https://api.machines.dev/v1/apps/{app_name}/machines/{machine_id}/stop"
     logger.info(f"Stopping Fly machine {machine_id} ({app_name}) via API")
@@ -626,7 +630,7 @@ async def scheduler_loop() -> None:
         f"ORB gate active — first effective signals from ~09:45 ET "
         f"(requires {MIN_BARS_FOR_SCAN} bars)"
     )
-    global _last_close_date
+    global _last_close_date, _last_shutdown_date
     heartbeat_counter = 0
 
     while True:
@@ -669,13 +673,21 @@ async def scheduler_loop() -> None:
 
         # ── Daily shutdown at 10:00 AM SGT ────────────────────────────
         # Stops the Fly machine so it is fully deallocated.
-        # GitHub Actions restarts it at 9:25 AM ET each weekday.
+        # An external cron / GitHub Actions restarts it at 9:25 AM ET.
         # SGT has no DST so 10:00 AM SGT = 02:00 UTC always.
+        # Uses an hour-wide window (any minute in the 10 AM SGT hour) +
+        # a date guard to prevent re-triggering — much more reliable than
+        # a 30-second second<30 window that could be missed by asyncio.
         now_sgt = datetime.now(SGT)
-        if now_sgt.hour == 10 and now_sgt.minute == 0 and now_sgt.second < 30:
+        if (
+            now_sgt.hour == 10
+            and _last_shutdown_date != now_sgt.date()
+        ):
+            _last_shutdown_date = now_sgt.date()
             logger.info(
-                "10:00 AM SGT — scheduled daily shutdown. "
-                "GitHub Actions will restart at 9:25 AM ET."
+                f"10:00 AM SGT ({now_sgt.strftime('%H:%M SGT')}) — "
+                "scheduled daily shutdown. "
+                "External cron will restart at 9:25 AM ET."
             )
             await _fly_stop_self()
             return   # Exit scheduler_loop cleanly → Telegram app shuts down gracefully
