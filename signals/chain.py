@@ -30,19 +30,26 @@ CANDIDATE_WIDTHS = [2.5, 5, 7.5, 10, 12.5, 15, 20, 25]
 MIN_CREDIT_RATIO = 0.33
 
 
+def _is_monthly_expiry(exp: date) -> bool:
+    """Standard equity/index monthly expiry = 3rd Friday of the month."""
+    return exp.weekday() == 4 and 15 <= exp.day <= 21
+
+
 def _select_expiry_from_chain(
-    chain: dict, symbol: str, dte_min: int, dte_max: int
+    chain: dict, symbol: str, dte_min: int, dte_max: int,
+    monthly_only: bool = False,
 ) -> Optional[str]:
     today      = date.today()
     candidates = [
         ((exp - today).days, exp)
         for exp in chain.keys()
         if dte_min <= (exp - today).days <= dte_max
+        and (not monthly_only or _is_monthly_expiry(exp))
     ]
     if not candidates:
         all_dtes = sorted((exp - today).days for exp in chain.keys())
         logger.warning(
-            f"{symbol}: no expiry in DTE {dte_min}–{dte_max}. "
+            f"{symbol}: no {'monthly ' if monthly_only else ''}expiry in DTE {dte_min}–{dte_max}. "
             f"Available DTEs: {all_dtes[:10]}"
         )
         return None
@@ -282,7 +289,7 @@ async def build_iron_condor(
     if not chain:
         return None
 
-    expiry = _select_expiry_from_chain(chain, symbol, dte_min, dte_max)
+    expiry = _select_expiry_from_chain(chain, symbol, dte_min, dte_max, monthly_only=True)
     if not expiry:
         return None
 
@@ -364,7 +371,7 @@ async def build_jade_lizard(
     if not chain:
         return None
 
-    expiry = _select_expiry_from_chain(chain, symbol, dte_min, dte_max)
+    expiry = _select_expiry_from_chain(chain, symbol, dte_min, dte_max, monthly_only=True)
     if not expiry:
         return None
 
@@ -504,7 +511,9 @@ async def build_spread(
     if not chain:
         return None
 
-    expiry = _select_expiry_from_chain(chain, symbol, dte_min, dte_max)
+    expiry = _select_expiry_from_chain(
+        chain, symbol, dte_min, dte_max, monthly_only=(structure == "credit")
+    )
     if not expiry:
         return None
 
