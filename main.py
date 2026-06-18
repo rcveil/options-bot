@@ -1,7 +1,7 @@
 """
 main.py
 Scheduler and main scan loop.
-Scans every 10 minutes during market hours: 09:30–16:00 ET weekdays.
+Scans every 15 minutes during market hours: 09:30–16:00 ET weekdays.
 Uses pure async time checking — no schedule library.
 Heartbeat every 5 minutes confirms loop is alive.
 /scan command triggers scan immediately from Telegram.
@@ -56,13 +56,13 @@ MARKET_CLOSE_HOUR  = 16
 MARKET_CLOSE_MINUTE = 0
 
 # Scan interval in minutes
-SCAN_INTERVAL_MINUTES = 10
+SCAN_INTERVAL_MINUTES = 15
 
 # Strategies requiring 3-of-3 indicator conviction
 HIGH_CONVICTION_STRATEGIES = {"jade_lizard", "iron_condor", "bull_call_spread", "bear_put_spread"}
 
 # Tracks the last scan time — "YYYY-MM-DD HH:MM" in ET
-# Prevents double-firing within the same 10-minute window
+# Prevents double-firing within the same scan window
 _last_scan_slot: str = ""
 
 # Tracks the last date the expiry settlement job ran
@@ -85,8 +85,8 @@ def _is_market_open(now: datetime) -> bool:
 
 def _current_scan_slot(now: datetime) -> str:
     """
-    Returns a string representing the current 10-minute slot.
-    e.g. "2026-04-22 09:30" for any time between 09:30 and 09:39.
+    Returns a string representing the current scan slot (SCAN_INTERVAL_MINUTES wide).
+    e.g. "2026-04-22 09:30" for any time between 09:30 and 09:44 (15-min slots).
     """
     slot_minute = (now.minute // SCAN_INTERVAL_MINUTES) * SCAN_INTERVAL_MINUTES
     return now.strftime(f"%Y-%m-%d %H:") + f"{slot_minute:02d}"
@@ -568,7 +568,7 @@ async def scan_ticker(symbol: str, vix: float, regime: str) -> None:
 async def run_scan() -> None:
     """
     Run full scan across all symbols.
-    Called by scheduler every 10 minutes during market hours,
+    Called by scheduler every SCAN_INTERVAL_MINUTES during market hours,
     and by /scan command for manual triggers.
     """
     global _last_scan_slot
@@ -576,7 +576,7 @@ async def run_scan() -> None:
     now  = datetime.now(ET)
     slot = _current_scan_slot(now)
 
-    # Prevent double-firing within the same 10-minute window
+    # Prevent double-firing within the same scan window
     if _last_scan_slot == slot:
         logger.info(f"Scan already ran for slot {slot} — skipping")
         return
@@ -618,7 +618,7 @@ async def scheduler_loop() -> None:
     """
     Checks every 30 seconds:
     - Is it a weekday between 09:30 and 16:00 ET?
-    - Has 10 minutes elapsed since the last scan?
+    - Has SCAN_INTERVAL_MINUTES elapsed since the last scan?
     If both true, fires run_scan().
     Heartbeat log every 5 minutes.
     """
@@ -646,7 +646,7 @@ async def scheduler_loop() -> None:
             heartbeat_counter = 0
 
         if _is_market_open(now):
-            # Fire at the start of each 10-minute slot
+            # Fire at the start of each scan slot
             slot_second = (now.minute % SCAN_INTERVAL_MINUTES) * 60 + now.second
             if slot_second < 30:    # within the first 30s of a new slot
                 slot = _current_scan_slot(now)
